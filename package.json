@@ -1,6 +1,6 @@
 {
   "name": "mevoric",
-  "version": "2.0.0",
+  "version": "2.2.0",
   "description": "Unified memory + agent bridge for Claude Code. Semantic recall, cross-tab messaging, session checkpoints — one MCP server.",
   "type": "module",
   "main": "server.mjs",
@@ -29,10 +29,13 @@
   "files": [
     "server.mjs",
     "init.mjs",
+    "watcher.mjs",
     "README.md",
     "LICENSE"
   ],
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.0.0"
+    "@anthropic-ai/claude-agent-sdk": "^0.2.54",
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "node-notifier": "^10.0.1"
   }
 }

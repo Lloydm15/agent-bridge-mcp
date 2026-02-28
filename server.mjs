@@ -28,6 +28,7 @@ import {
 } from 'fs';
 import { resolve, dirname } from 'path';
 import { randomBytes, randomUUID } from 'crypto';
+import { spawn } from 'child_process';
 import { homedir, tmpdir, platform } from 'os';
 
 // ============================================================
@@ -65,6 +66,10 @@ const MEMORY_SERVER_URL = process.env.MEVORIC_SERVER_URL
 
 // Session-level conversation ID for memory tools
 const sessionConversationId = randomUUID();
+
+// Cache retrieved memories so judge_memories can evaluate them locally
+// Map<conversationId, [{mem0_id, memory, score}]>
+const retrievalCache = new Map();
 
 // Write conversation ID to temp file so external tools can reference it
 const CONVID_FILE = resolve(tmpdir(), 'mevoric-convid');
@@ -663,22 +668,42 @@ async function handleRetrieveMemories(args) {
   const query = args.query;
   if (!query) return { error: 'query is required' };
   const userId = args.user_id || 'lloyd';
+  const project = process.cwd().split(/[\\/]/).pop();
+
+  const SCORE_THRESHOLD = 0.25;
+  const MAX_RESULTS = 10;
 
   try {
     const data = await memoryFetch('/retrieve', {
       query,
       user_id: userId,
-      conversation_id: sessionConversationId
+      conversation_id: sessionConversationId,
+      project,
+      limit: MAX_RESULTS
     }, 30000);
 
-    const memories = data.memories || [];
-    return {
-      memories: memories.map(m => ({
+    const raw = data.memories || [];
+    const filtered = raw
+      .filter(m => (m.score || 0) >= SCORE_THRESHOLD)
+      .slice(0, MAX_RESULTS)
+      .map((m, i) => ({
+        mem0_id: m.mem0_id,
         memory: m.memory,
         score: Math.round((m.score || 0) * 1000) / 1000,
-        rank: m.rank
-      })),
-      conversation_id: sessionConversationId
+        rank: i + 1
+      }));
+
+    // Cache for judge_memories (includes mem0_id for verdict posting)
+    if (filtered.length > 0) {
+      retrievalCache.set(sessionConversationId, filtered);
+    }
+
+    return {
+      memories: filtered.map(m => ({ memory: m.memory, score: m.score, rank: m.rank })),
+      conversation_id: sessionConversationId,
+      ...(filtered.length === 0 && raw.length > 0
+        ? { note: `${raw.length} memories found but none above relevance threshold (${SCORE_THRESHOLD})` }
+        : {})
     };
   } catch (err) {
     return { error: err.message, conversation_id: sessionConversationId };
@@ -693,6 +718,7 @@ async function handleStoreConversation(args) {
   }
   const userId = args.user_id || 'lloyd';
   const convId = args.conversation_id || sessionConversationId;
+  const project = process.cwd().split(/[\\/]/).pop();
 
   try {
     const data = await memoryFetch('/ingest', {
@@ -701,13 +727,142 @@ async function handleStoreConversation(args) {
         { role: 'assistant', content: assistantResponse }
       ],
       user_id: userId,
-      conversation_id: convId
+      conversation_id: convId,
+      project
     }, 60000);
 
     return { status: data.status || 'stored', conversation_id: convId };
   } catch (err) {
     return { error: err.message, conversation_id: convId };
   }
+}
+
+const JUDGE_PROMPT = `You are evaluating whether a retrieved memory helped answer a user's question.
+
+USER QUERY:
+{query}
+
+ASSISTANT RESPONSE:
+{response}
+
+RETRIEVED MEMORY:
+{memory}
+
+EVALUATION — walk through these steps:
+
+Step 1: Find evidence. Quote any part of the response that uses information from this memory.
+        Did you find evidence? Answer YES or NO.
+
+Step 2:
+  If YES (memory was used): Is the information in the memory correct based on the response?
+    - If correct → verdict: "strengthen"
+    - If incorrect → verdict: "correct", and provide the corrected text
+
+  If NO (memory was NOT used): Why wasn't it used?
+    - If the memory is irrelevant to the query → verdict: "drop"
+    - If the memory is related but wasn't needed → verdict: "weaken"
+
+Return JSON only:
+{
+  "evidence": "quote from response, or 'none'",
+  "reasoning": "your step-by-step reasoning",
+  "verdict": "strengthen" | "weaken" | "correct" | "drop",
+  "confidence": 0.0 to 1.0,
+  "corrected_content": "only if verdict is correct, otherwise null"
+}`;
+
+const CONFIDENCE_THRESHOLD = 0.85;
+
+function getCleanEnv() {
+  const env = { ...process.env };
+  delete env.ANTHROPIC_API_KEY;
+  delete env.CLAUDECODE;
+  return env;
+}
+
+async function judgeOneMemory(queryText, responseText, memoryContent) {
+  const prompt = JUDGE_PROMPT
+    .replace('{query}', queryText)
+    .replace('{response}', responseText)
+    .replace('{memory}', memoryContent);
+
+  let claudeQuery;
+  try {
+    const sdk = await import('@anthropic-ai/claude-agent-sdk');
+    claudeQuery = sdk.query;
+  } catch {
+    throw new Error('Claude Agent SDK not available');
+  }
+
+  let fullText = '';
+  for await (const ev of claudeQuery({
+    prompt,
+    options: {
+      maxTurns: 1,
+      allowedTools: [],
+      model: 'haiku',
+      permissionMode: 'bypassPermissions',
+      allowDangerouslySkipPermissions: true,
+      persistSession: false,
+      env: getCleanEnv(),
+    }
+  })) {
+    if (ev?.type === 'assistant' && ev.message?.content) {
+      for (const block of ev.message.content) {
+        if (block.type === 'text' && block.text) fullText += block.text;
+      }
+    }
+    if (ev?.type === 'result' && ev.text) fullText = ev.text;
+  }
+
+  let cleaned = fullText.trim();
+  if (cleaned.startsWith('```')) cleaned = cleaned.split('\n', 2)[1] ? cleaned.slice(cleaned.indexOf('\n') + 1) : cleaned.slice(3);
+  if (cleaned.endsWith('```')) cleaned = cleaned.slice(0, -3);
+  cleaned = cleaned.trim();
+
+  return JSON.parse(cleaned);
+}
+
+async function runJudgeInBackground(memories, queryText, responseText, convId, userId) {
+  let judged = 0;
+  let failed = 0;
+
+  for (const mem of memories) {
+    try {
+      const judgment = await judgeOneMemory(queryText, responseText, mem.memory);
+      const verdict = judgment.verdict || 'weaken';
+      const confidence = parseFloat(judgment.confidence) || 0;
+      const note = judgment.reasoning || '';
+      const corrected = judgment.corrected_content || null;
+
+      // Confidence guard: strengthen always passes, everything else needs >= 85%
+      const actionTaken = (verdict === 'strengthen' || confidence >= CONFIDENCE_THRESHOLD)
+        ? 'logged' : `blocked_low_confidence (${Math.round(confidence * 100)}%)`;
+
+      // POST verdict to Newcode for storage
+      try {
+        await memoryFetch('/api/verdict', {
+          mem0_id: mem.mem0_id,
+          conversation_id: convId,
+          user_id: userId,
+          verdict,
+          judge_note: note,
+          corrected_content: corrected,
+          action_taken: actionTaken,
+        }, 10000);
+      } catch {
+        // Storage failed but judgment succeeded — log locally
+        console.error(`[Mevoric] Failed to store verdict for ${mem.mem0_id}`);
+      }
+
+      judged++;
+    } catch (err) {
+      failed++;
+      console.error(`[Mevoric] Judge failed for memory: ${err.message}`);
+    }
+  }
+
+  console.error(`[Mevoric] Judge complete: ${judged} judged, ${failed} failed out of ${memories.length}`);
 }
 
 async function handleJudgeMemories(args) {
@@ -719,18 +874,22 @@ async function handleJudgeMemories(args) {
   }
   const userId = args.user_id || 'lloyd';
 
-  try {
-    const data = await memoryFetch('/feedback', {
-      conversation_id: convId,
-      user_id: userId,
-      query_text: queryText,
-      response_text: responseText
-    }, 30000);
-
-    return { status: data.status || 'judging', conversation_id: convId };
-  } catch (err) {
-    return { error: err.message, conversation_id: convId };
+  // Get cached memories from this conversation's retrieve call
+  const memories = retrievalCache.get(convId);
+  if (!memories || memories.length === 0) {
+    return { status: 'skipped', reason: 'No memories retrieved in this conversation to judge', conversation_id: convId };
   }
+
+  // Run judging in background — don't block the tool response
+  runJudgeInBackground(memories, queryText, responseText, convId, userId)
+    .catch(err => console.error(`[Mevoric] Background judge error: ${err.message}`));
+
+  return {
+    status: 'judging',
+    count: memories.length,
+    conversation_id: convId,
+    note: 'Evaluating locally via Claude SDK. Verdicts will be posted to Newcode.'
+  };
 }
 
 // ============================================================
@@ -1187,6 +1346,7 @@ async function runIngest() {
     if (!convId) convId = sessionId; // fallback
 
     try {
+      const project = process.cwd().split(/[\\/]/).pop();
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 15000);
       await fetch(`${MEMORY_SERVER_URL}/ingest`, {
@@ -1198,7 +1358,8 @@ async function runIngest() {
             { role: 'assistant', content: cleanAssistant.slice(0, 10000) }
           ],
           user_id: 'lloyd',
-          conversation_id: convId
+          conversation_id: convId,
+          project
         }),
         signal: controller.signal
       });
@@ -1223,6 +1384,22 @@ async function runIngest() {
       clearTimeout(timer2);
     } catch {} // Best-effort
   }
+
+  // --- 5. Broadcast session-end notification (picked up by watcher) ---
+  try {
+    mkdirSync(MESSAGES_DIR, { recursive: true });
+    const summary = userMsg.slice(0, 100) || 'session ended';
+    const msgData = JSON.stringify({
+      fromName: name,
+      toName: '*',
+      broadcast: true,
+      to: '*',
+      content: `${name} finished: ${summary}`,
+      timestamp: new Date().toISOString()
+    });
+    const msgFile = resolve(MESSAGES_DIR, `${Date.now()}-${randomBytes(4).toString('hex')}.json`);
+    writeFileSync(msgFile, msgData);
+  } catch {}
 
   process.exit(0);
 }
@@ -1290,8 +1467,31 @@ async function runCheckMessages() {
 // CLI: --bootstrap-context (SessionStart hook mode)
 // ============================================================
 
+function ensureWatcherRunning() {
+  const pidFile = resolve(DATA_DIR, 'watcher.pid');
+  try {
+    const pid = parseInt(readFileSync(pidFile, 'utf8').trim(), 10);
+    if (pid && isProcessAlive(pid)) return; // already running
+  } catch {}
+
+  // Spawn watcher as detached background process
+  const watcherPath = resolve(dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Z]:)/, '$1')), 'watcher.mjs');
+  if (!existsSync(watcherPath)) return;
+
+  const child = spawn(process.execPath, [watcherPath], {
+    detached: true,
+    stdio: 'ignore',
+    windowsHide: true,
+  });
+  child.unref();
+
+  // Save PID so we can check next time
+  try { writeFileSync(pidFile, String(child.pid), 'utf8'); } catch {}
+}
+
 async function runBootstrapContext() {
   ensureDirs();
+  ensureWatcherRunning();
 
   const chunks = [];
   for await (const chunk of process.stdin) chunks.push(chunk);
