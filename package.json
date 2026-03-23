@@ -1,6 +1,6 @@
 {
   "name": "mevoric",
-  "version": "2.2.0",
+  "version": "2.3.0",
   "description": "Unified memory + agent bridge for Claude Code. Semantic recall, cross-tab messaging, session checkpoints — one MCP server.",
   "type": "module",
   "main": "server.mjs",

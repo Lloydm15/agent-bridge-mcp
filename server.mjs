@@ -24,12 +24,12 @@ import {
 } from '@modelcontextprotocol/sdk/types.js';
 import {
   existsSync, mkdirSync, writeFileSync, readFileSync,
-  readdirSync, unlinkSync, renameSync
+  readdirSync, unlinkSync, renameSync, appendFileSync
 } from 'fs';
 import { resolve, dirname } from 'path';
 import { randomBytes, randomUUID } from 'crypto';
 import { spawn } from 'child_process';
-import { homedir, tmpdir, platform } from 'os';
+import { homedir, tmpdir, platform, hostname } from 'os';
 
 // ============================================================
 // Constants (configurable via environment variables)
@@ -38,12 +38,12 @@ import { homedir, tmpdir, platform } from 'os';
 function getDefaultDataDir() {
   const p = platform();
   if (p === 'win32') {
-    return resolve(process.env.LOCALAPPDATA || resolve(homedir(), 'AppData', 'Local'), 'mevoric');
+    return resolve(process.env.LOCALAPPDATA || resolve(homedir(), 'AppData', 'Local'), 'agent-bridge');
   }
   if (p === 'darwin') {
-    return resolve(homedir(), 'Library', 'Application Support', 'mevoric');
+    return resolve(homedir(), 'Library', 'Application Support', 'agent-bridge');
   }
-  return resolve(process.env.XDG_DATA_HOME || resolve(homedir(), '.local', 'share'), 'mevoric');
+  return resolve(process.env.XDG_DATA_HOME || resolve(homedir(), '.local', 'share'), 'agent-bridge');
 }
 
 // Support legacy AGENT_BRIDGE_DATA_DIR for backwards compat during migration
@@ -54,10 +54,13 @@ const CONTEXT_DIR = resolve(DATA_DIR, 'context');
 const CURSORS_DIR = resolve(DATA_DIR, 'cursors');
 const CHECKPOINTS_DIR = resolve(DATA_DIR, 'checkpoints');
 const CHECKPOINT_MAX_AGE_MS = 24 * 60 * 60 * 1000; // 24 hours
-const HEARTBEAT_INTERVAL_MS = parseInt(process.env.MEVORIC_HEARTBEAT_MS || '15000', 10);
+const HEARTBEAT_INTERVAL_MS = parseInt(process.env.MEVORIC_HEARTBEAT_MS || '5000', 10);
 const STALE_THRESHOLD_MS = HEARTBEAT_INTERVAL_MS * 3;
 const DEAD_THRESHOLD_MS = parseInt(process.env.MEVORIC_DEAD_MS || '300000', 10);
 const MESSAGE_TTL_MS = parseInt(process.env.MEVORIC_MESSAGE_TTL_MS || '3600000', 10);
+
+// Hub server (central agent discovery + messaging across machines)
+const HUB_URL = process.env.MEVORIC_HUB_URL || null;
 
 // Memory server (newcode backend)
 const MEMORY_SERVER_URL = process.env.MEVORIC_SERVER_URL
@@ -84,6 +87,7 @@ let agentName = process.env.MEVORIC_AGENT_NAME || process.env.AGENT_BRIDGE_NAME 
 let agentBaseName = agentName;
 const startedAt = new Date().toISOString();
 let lastReadTimestamp = Date.now();
+let lastHubReadTimestamp = Date.now();
 let heartbeatTimer = null;
 
 // ============================================================
@@ -225,6 +229,7 @@ function cleanOldMessages() {
 function startHeartbeat() {
   heartbeatTimer = setInterval(() => {
     writeAgentFile();
+    hubRegister(); // heartbeat to hub
     cleanOldMessages();
   }, HEARTBEAT_INTERVAL_MS);
   heartbeatTimer.unref();
@@ -374,6 +379,51 @@ async function memoryFetch(endpoint, body, timeoutMs = 30000) {
 }
 
 // ============================================================
+// HTTP Helper (for hub server calls)
+// ============================================================
+
+async function hubFetch(method, path, body = null, timeoutMs = 5000) {
+  if (!HUB_URL) return null;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const opts = {
+      method,
+      headers: { 'Content-Type': 'application/json' },
+      signal: controller.signal
+    };
+    if (body) opts.body = JSON.stringify(body);
+    const res = await fetch(`${HUB_URL}${path}`, opts);
+    clearTimeout(timer);
+    return await res.json();
+  } catch {
+    clearTimeout(timer);
+    return null; // Hub unreachable — fall back to local
+  }
+}
+
+// ============================================================
+// Hub Registration Helper
+// ============================================================
+
+function hubRegister() {
+  hubFetch('POST', '/api/agents/register', {
+    id: agentId,
+    name: agentName,
+    baseName: agentBaseName || agentName,
+    project: process.cwd().split(/[\\/]/).pop(),
+    cwd: process.cwd(),
+    pid: process.pid,
+    host: hostname(),
+    startedAt
+  }).catch(() => {});
+}
+
+function hubUnregister() {
+  hubFetch('DELETE', `/api/agents/${agentId}`).catch(() => {});
+}
+
+// ============================================================
 // Tool Handlers — Bridge
 // ============================================================
 
@@ -395,6 +445,7 @@ async function handleRegister(args) {
   agentName = finalName;
   agentBaseName = name;
   writeAgentFile();
+  hubRegister();
 
   return {
     registered: true,
@@ -409,10 +460,22 @@ async function handleRegister(args) {
 }
 
 async function handleListAgents() {
-  const agents = getAllAgents();
+  const localAgents = getAllAgents();
+  const localIds = new Set(localAgents.map(a => a.id));
+
+  // Merge remote agents from hub (if available)
+  const hubResult = await hubFetch('GET', '/api/agents');
+  if (hubResult && hubResult.agents) {
+    for (const remote of hubResult.agents) {
+      if (!localIds.has(remote.id)) {
+        localAgents.push({ ...remote, isMe: false });
+      }
+    }
+  }
+
   return {
-    agents,
-    totalActive: agents.filter(a => a.status === 'active').length,
+    agents: localAgents,
+    totalActive: localAgents.filter(a => a.status === 'active').length,
     myId: agentId,
     myName: agentName
   };
@@ -433,6 +496,12 @@ async function handleSendMessage(args) {
   }
 
   const msg = writeMessage(target.id, target.name, content, false);
+  // Also send via hub for cross-machine delivery
+  hubFetch('POST', '/api/messages', {
+    from: agentId, fromName: agentName,
+    to: target.id, toName: target.name,
+    content, project: process.cwd().split(/[\\/]/).pop()
+  }).catch(() => {});
   return {
     sent: true,
     messageId: msg.id,
@@ -443,10 +512,23 @@ async function handleSendMessage(args) {
 
 async function handleReadMessages(args) {
   const includeBroadcasts = args.include_broadcasts !== false;
-  const messages = readNewMessages(includeBroadcasts);
+  const localMessages = readNewMessages(includeBroadcasts);
+
+  // Also read from hub for cross-machine messages
+  const hubResult = await hubFetch('GET', `/api/messages/${agentId}?name=${encodeURIComponent(agentName || '')}&since=${new Date(lastHubReadTimestamp).toISOString()}`);
+  if (hubResult && hubResult.messages) {
+    const localIds = new Set(localMessages.map(m => m.id));
+    for (const msg of hubResult.messages) {
+      if (!localIds.has(msg.id)) {
+        localMessages.push(msg);
+      }
+    }
+    lastHubReadTimestamp = Date.now();
+  }
+
   return {
-    messages,
-    count: messages.length,
+    messages: localMessages,
+    count: localMessages.length,
     myId: agentId,
     myName: agentName
   };
@@ -458,6 +540,11 @@ async function handleBroadcast(args) {
 
   const agents = getAllAgents().filter(a => !a.isMe && a.status === 'active');
   const msg = writeMessage('*', null, content, true);
+  // Also broadcast via hub
+  hubFetch('POST', '/api/messages/broadcast', {
+    from: agentId, fromName: agentName,
+    content, project: process.cwd().split(/[\\/]/).pop()
+  }).catch(() => {});
 
   return {
     broadcast: true,
@@ -465,6 +552,81 @@ async function handleBroadcast(args) {
     activeRecipients: agents.length,
     timestamp: msg.timestamp
   };
+}
+
+// ============================================================
+// Tool Handlers — Knowledge (provenance + namespaces + verification)
+// Design: Memori namespaces + Collaborative Memory provenance + MIT debate verification
+// ============================================================
+
+async function handleStoreKnowledge(args) {
+  const { content, source } = args;
+  if (!content) return { error: 'content is required — what fact or finding are you storing?' };
+
+  const project = process.cwd().split(/[\\/]/).pop();
+  const result = await hubFetch('POST', '/api/knowledge', {
+    content,
+    project,
+    agent: agentName,
+    agentProject: project,
+    host: hostname(),
+    source: source || null
+  });
+
+  if (!result) return { error: 'Hub unreachable — knowledge requires the central hub' };
+  return result;
+}
+
+async function handleQueryKnowledge(args) {
+  const { project: targetProject, search, shared_only } = args;
+  const myProject = process.cwd().split(/[\\/]/).pop();
+
+  let path;
+  if (shared_only) {
+    path = '/api/knowledge/shared';
+  } else {
+    const proj = targetProject || myProject;
+    const params = new URLSearchParams();
+    params.set('project', proj);
+    if (search) params.set('search', search);
+    path = `/api/knowledge?${params.toString()}`;
+  }
+
+  const result = await hubFetch('GET', path);
+  if (!result) return { error: 'Hub unreachable — knowledge requires the central hub' };
+  return result;
+}
+
+async function handleShareKnowledge(args) {
+  const { id, target_project } = args;
+  if (!id) return { error: 'Knowledge item id is required' };
+  if (!target_project) return { error: 'target_project is required — which project should see this?' };
+
+  const result = await hubFetch('POST', `/api/knowledge/${id}/share`, {
+    targetProject: target_project
+  });
+
+  if (!result) return { error: 'Hub unreachable — knowledge requires the central hub' };
+  return result;
+}
+
+async function handleVerifyKnowledge(args) {
+  const { id, verdict, reason } = args;
+  if (!id) return { error: 'Knowledge item id is required' };
+  if (!verdict || !['confirmed', 'challenged'].includes(verdict)) {
+    return { error: 'verdict must be "confirmed" or "challenged"' };
+  }
+
+  const project = process.cwd().split(/[\\/]/).pop();
+  const result = await hubFetch('POST', `/api/knowledge/${id}/verify`, {
+    agent: agentName,
+    project,
+    verdict,
+    reason: reason || null
+  });
+
+  if (!result) return { error: 'Hub unreachable — knowledge requires the central hub' };
+  return result;
 }
 
 // ============================================================
@@ -530,6 +692,21 @@ async function handleShareContext(args) {
 async function handleGetContext(args) {
   const { from } = args;
 
+  // Build a set of currently-alive agent base names for prioritization
+  const aliveAgentNames = new Set();
+  try {
+    const agentFiles = readdirSync(AGENTS_DIR).filter(f => f.endsWith('.json'));
+    for (const file of agentFiles) {
+      try {
+        const agent = JSON.parse(readFileSync(resolve(AGENTS_DIR, file), 'utf8'));
+        if (agent.pid && isProcessAlive(agent.pid)) {
+          if (agent.baseName) aliveAgentNames.add(agent.baseName.toLowerCase());
+          if (agent.name) aliveAgentNames.add(agent.name.toLowerCase());
+        }
+      } catch {}
+    }
+  } catch {}
+
   if (from) {
     const safeName = from.replace(/[^a-zA-Z0-9_-]/g, '_').toLowerCase();
     let files;
@@ -553,16 +730,72 @@ async function handleGetContext(args) {
     if (matches.length === 0) {
       return { found: false, error: `No shared context found for "${from}"` };
     }
-    if (matches.length === 1) {
-      return { found: true, context: matches[0] };
+
+    // Sort by most recent first, return only the latest
+    matches.sort((a, b) => new Date(b.updatedAt || 0) - new Date(a.updatedAt || 0));
+    const latest = matches[0];
+    // Flatten exchanges format to content
+    if (!latest.content && latest.exchanges && latest.exchanges.length > 0) {
+      const recent = latest.exchanges.slice(-5);
+      latest.content = recent.map(e =>
+        `User: ${(e.user || '').slice(0, 300)}\nAssistant: ${(e.assistant || '').slice(0, 800)}`
+      ).join('\n---\n');
+      delete latest.exchanges;
     }
-    return { found: true, contexts: matches, count: matches.length };
+    // Cap content to 8KB so it doesn't overflow
+    if (latest.content && latest.content.length > 8000) {
+      latest.content = latest.content.slice(0, 8000) + '\n... [truncated, ' + latest.content.length + ' chars total]';
+    }
+    return { found: true, context: latest };
   }
 
-  const contexts = readAllContextFiles();
+  // No 'from' specified — return all contexts, prioritized and capped
+  const allContexts = readAllContextFiles();
+
+  // Group by base agent name, keep only the most recent per agent
+  const byAgent = new Map();
+  for (const ctx of allContexts) {
+    const key = (ctx.baseName || ctx.agentName || 'unknown').toLowerCase();
+    const existing = byAgent.get(key);
+    if (!existing || new Date(ctx.updatedAt || 0) > new Date(existing.updatedAt || 0)) {
+      byAgent.set(key, ctx);
+    }
+  }
+
+  // Sort: active agents first, then by recency
+  const deduped = [...byAgent.values()].sort((a, b) => {
+    const aName = (a.baseName || a.agentName || '').toLowerCase();
+    const bName = (b.baseName || b.agentName || '').toLowerCase();
+    const aAlive = aliveAgentNames.has(aName) ? 1 : 0;
+    const bAlive = aliveAgentNames.has(bName) ? 1 : 0;
+    if (aAlive !== bAlive) return bAlive - aAlive; // alive first
+    return new Date(b.updatedAt || 0) - new Date(a.updatedAt || 0); // newest first
+  });
+
+  // Cap each context so total doesn't overflow
+  const MAX_PER_CONTEXT = 4000;
+  for (const ctx of deduped) {
+    if (ctx.content && ctx.content.length > MAX_PER_CONTEXT) {
+      ctx.content = ctx.content.slice(0, MAX_PER_CONTEXT) + '\n... [truncated, ' + ctx.content.length + ' chars total]';
+    }
+    // Handle old exchanges format — flatten to content
+    if (!ctx.content && ctx.exchanges && ctx.exchanges.length > 0) {
+      const recent = ctx.exchanges.slice(-3);
+      let flat = recent.map(e =>
+        `User: ${(e.user || '').slice(0, 200)}\nAssistant: ${(e.assistant || '').slice(0, 500)}`
+      ).join('\n---\n');
+      if (flat.length > MAX_PER_CONTEXT) {
+        flat = flat.slice(0, MAX_PER_CONTEXT) + '\n... [truncated]';
+      }
+      ctx.content = flat;
+      delete ctx.exchanges;
+    }
+  }
+
   return {
-    contexts,
-    count: contexts.length
+    contexts: deduped,
+    count: deduped.length,
+    totalBeforeDedup: allContexts.length
   };
 }
 
@@ -1150,6 +1383,56 @@ const TOOLS = [
         from: { type: 'string', description: 'Agent name to load checkpoint for (defaults to your own name)' }
       }
     }
+  },
+  // --- Knowledge tools (provenance + namespaces + verification) ---
+  {
+    name: 'store_knowledge',
+    description: 'Store a fact, finding, or decision with full provenance tracking. Every piece of knowledge records who stored it, from which project, when, and from what source. Knowledge is stored in your project\'s namespace by default.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        content: { type: 'string', description: 'The fact, finding, or decision to store' },
+        source: { type: 'string', description: 'Where this information came from (e.g., "user told me", "read from config.ts", "API response", "https://...")' }
+      },
+      required: ['content']
+    }
+  },
+  {
+    name: 'query_knowledge',
+    description: 'Search the knowledge base. By default searches your own project\'s namespace. You can search other projects or only shared knowledge.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        project: { type: 'string', description: 'Project namespace to search (defaults to your own project)' },
+        search: { type: 'string', description: 'Text to search for within knowledge content' },
+        shared_only: { type: 'boolean', description: 'If true, only return knowledge that has been shared across projects' }
+      }
+    }
+  },
+  {
+    name: 'share_knowledge',
+    description: 'Share a piece of knowledge from your project to another project\'s namespace. Once shared, agents in the target project can see it and verify or challenge it.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'string', description: 'The knowledge item ID to share (from store_knowledge or query_knowledge results)' },
+        target_project: { type: 'string', description: 'The project to share this knowledge with (e.g., "Cortex", "Clonebot")' }
+      },
+      required: ['id', 'target_project']
+    }
+  },
+  {
+    name: 'verify_knowledge',
+    description: 'Verify or challenge a piece of shared knowledge. Use "confirmed" if the information is correct based on your evidence. Use "challenged" if you have evidence it is wrong. This builds a consensus — multiple agents verifying or challenging determines the final status.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'string', description: 'The knowledge item ID to verify' },
+        verdict: { type: 'string', enum: ['confirmed', 'challenged'], description: '"confirmed" if correct, "challenged" if incorrect' },
+        reason: { type: 'string', description: 'Why you are confirming or challenging — cite your evidence' }
+      },
+      required: ['id', 'verdict']
+    }
   }
 ];
 
@@ -1175,6 +1458,11 @@ async function handleToolCall(name, args) {
     // Checkpoints
     case 'save_checkpoint': return handleSaveCheckpoint(args);
     case 'load_checkpoint': return handleLoadCheckpoint(args);
+    // Knowledge
+    case 'store_knowledge': return handleStoreKnowledge(args);
+    case 'query_knowledge': return handleQueryKnowledge(args);
+    case 'share_knowledge': return handleShareKnowledge(args);
+    case 'verify_knowledge': return handleVerifyKnowledge(args);
     default: return { error: `Unknown tool: ${name}` };
   }
 }
@@ -1237,8 +1525,73 @@ async function runCapturePrompt() {
   const clean = stripSystemTags(prompt);
   if (clean.length < 5) process.exit(0);
 
+  // Append to JSONL file (one line per prompt, accumulates across the session)
   const tmp = tmpdir();
-  writeFileSync(resolve(tmp, `mevoric-prompt-${sessionId}`), clean, 'utf8');
+  const entry = JSON.stringify({ ts: Date.now(), prompt: clean });
+  appendFileSync(resolve(tmp, `mevoric-prompt-${sessionId}`), entry + '\n', 'utf8');
+
+  // Fire-and-forget POST to /ingest so this prompt is saved even if session crashes
+  try {
+    let convId = '';
+    try { convId = readFileSync(resolve(tmp, 'mevoric-convid'), 'utf8').trim(); } catch {}
+    if (!convId) convId = sessionId;
+
+    const project = process.cwd().split(/[\\/]/).pop();
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 3000);
+    await fetch(`${MEMORY_SERVER_URL}/ingest`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        messages: [{ role: 'user', content: clean.slice(0, 10000) }],
+        user_id: 'lloyd',
+        conversation_id: convId,
+        project
+      }),
+      signal: controller.signal
+    });
+    clearTimeout(timer);
+  } catch {} // Best-effort — prompt is still in JSONL file for Stop hook fallback
+
+  // --- Auto-share live context so other tabs can see what this session is doing ---
+  try {
+    ensureDirs();
+    const name = process.env.MEVORIC_AGENT_NAME || process.env.AGENT_BRIDGE_NAME || findAgentNameForSession(sessionId);
+    if (name) {
+      const safeName = name.replace(/[^a-zA-Z0-9_-]/g, '_').toLowerCase();
+      const ctxPath = resolve(CONTEXT_DIR, `${safeName}--${sessionId}.json`);
+
+      // Read accumulated prompts from this session
+      let prompts = [];
+      try {
+        prompts = readFileSync(resolve(tmp, `mevoric-prompt-${sessionId}`), 'utf8')
+          .split('\n').filter(Boolean)
+          .map(line => { try { return JSON.parse(line); } catch { return null; } })
+          .filter(Boolean);
+      } catch {}
+
+      // Build a rolling window of the last 5 prompts as live context
+      const recentPrompts = prompts.slice(-5).map(p => p.prompt.slice(0, 500));
+      const liveContent = recentPrompts.join('\n---\n');
+
+      if (liveContent.length > 10) {
+        const ctxData = JSON.stringify({
+          agentName: name,
+          baseName: name,
+          project: process.cwd().split(/[\\/]/).pop(),
+          updatedAt: new Date().toISOString(),
+          sessionId,
+          live: true,
+          content: liveContent
+        }, null, 2);
+
+        const ctxTmp = ctxPath + '.tmp';
+        writeFileSync(ctxTmp, ctxData);
+        renameSync(ctxTmp, ctxPath);
+      }
+    }
+  } catch {} // Best-effort — don't block on context sharing
+
   process.exit(0);
 }
 
@@ -1261,13 +1614,26 @@ async function runIngest() {
   const assistantMsg = data.last_assistant_message || '';
   if (!sessionId || !assistantMsg) process.exit(0);
 
-  // Read user prompt saved by --capture-prompt
+  // Read ALL user prompts saved by --capture-prompt (JSONL format, one per line)
   const tmp = tmpdir();
   const promptPath = resolve(tmp, `mevoric-prompt-${sessionId}`);
-  let userMsg = '';
+  let allPrompts = [];
   try {
-    userMsg = readFileSync(promptPath, 'utf8');
+    const raw = readFileSync(promptPath, 'utf8');
+    allPrompts = raw.split('\n').filter(Boolean).map(line => {
+      try { return JSON.parse(line); } catch { return null; }
+    }).filter(Boolean);
   } catch {}
+  // Fallback for old plain-text format (pre-JSONL)
+  if (allPrompts.length === 0) {
+    try {
+      const plain = readFileSync(promptPath, 'utf8');
+      if (plain && plain.length >= 5) allPrompts = [{ ts: Date.now(), prompt: plain }];
+    } catch {}
+  }
+  const userMsg = allPrompts.length > 0 ? allPrompts[allPrompts.length - 1].prompt : '';
+  // Clean up temp file
+  try { unlinkSync(promptPath); } catch {}
 
   const cleanAssistant = stripSystemTags(assistantMsg);
   if (!cleanAssistant || cleanAssistant.length < 50) process.exit(0);
@@ -1286,6 +1652,17 @@ async function runIngest() {
     else if (prev.content) existing = { exchanges: [{ role: 'context', content: prev.content }] };
   } catch {}
 
+  // Store all user prompts from this session, not just the last one
+  if (allPrompts.length > 1) {
+    for (let i = 0; i < allPrompts.length - 1; i++) {
+      existing.exchanges.push({
+        timestamp: new Date(allPrompts[i].ts).toISOString(),
+        user: allPrompts[i].prompt.slice(0, 2000),
+        assistant: ''
+      });
+    }
+  }
+  // Final exchange has the actual assistant response
   existing.exchanges.push({
     timestamp: new Date().toISOString(),
     user: userMsg.slice(0, 2000),
@@ -1336,8 +1713,8 @@ async function runIngest() {
     renameSync(cpTmp, cpPath);
   } catch {}
 
-  // --- 3. POST to memory server /ingest (ported from Python auto-ingest.py) ---
-  if (userMsg && cleanAssistant) {
+  // --- 3. POST to memory server /ingest — full conversation (all prompts + final response) ---
+  if ((allPrompts.length > 0 || userMsg) && cleanAssistant) {
     // Read conversation ID from temp file (written by MCP server process)
     let convId = '';
     try {
@@ -1346,6 +1723,17 @@ async function runIngest() {
     if (!convId) convId = sessionId; // fallback
 
     try {
+      // Build messages array: all user prompts + final assistant response
+      const messages = [];
+      if (allPrompts.length > 0) {
+        for (const entry of allPrompts) {
+          messages.push({ role: 'user', content: entry.prompt.slice(0, 10000) });
+        }
+      } else if (userMsg) {
+        messages.push({ role: 'user', content: userMsg.slice(0, 10000) });
+      }
+      messages.push({ role: 'assistant', content: cleanAssistant.slice(0, 10000) });
+
       const project = process.cwd().split(/[\\/]/).pop();
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 15000);
@@ -1353,10 +1741,7 @@ async function runIngest() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          messages: [
-            { role: 'user', content: userMsg.slice(0, 10000) },
-            { role: 'assistant', content: cleanAssistant.slice(0, 10000) }
-          ],
+          messages,
           user_id: 'lloyd',
           conversation_id: convId,
           project
@@ -1520,10 +1905,31 @@ async function runBootstrapContext() {
   } catch {}
 
   const mySessionId = data.session_id || '';
-  const contexts = readAllContextFiles().filter(c => {
+  const allContexts = readAllContextFiles().filter(c => {
     if (c.sessionId && mySessionId && c.sessionId === mySessionId) return false;
     if (c.agentId && c.agentId === myName) return false;
     return true;
+  });
+
+  // Dedup: keep only the most recent context per agent
+  const ctxByAgent = new Map();
+  for (const c of allContexts) {
+    const key = (c.baseName || c.agentName || 'unknown').toLowerCase();
+    const existing = ctxByAgent.get(key);
+    if (!existing || new Date(c.updatedAt || 0) > new Date(existing.updatedAt || 0)) {
+      ctxByAgent.set(key, c);
+    }
+  }
+
+  // Active agents first, then by recency
+  const activeNames = new Set(activeAgents.map(a => (a.baseName || a.name || '').toLowerCase()));
+  const contexts = [...ctxByAgent.values()].sort((a, b) => {
+    const aName = (a.baseName || a.agentName || '').toLowerCase();
+    const bName = (b.baseName || b.agentName || '').toLowerCase();
+    const aAlive = activeNames.has(aName) ? 1 : 0;
+    const bAlive = activeNames.has(bName) ? 1 : 0;
+    if (aAlive !== bAlive) return bAlive - aAlive;
+    return new Date(b.updatedAt || 0) - new Date(a.updatedAt || 0);
   });
 
   const cursor = readCursor(myName);
@@ -1625,11 +2031,13 @@ if (process.argv.includes('--capture-prompt')) {
     }
 
     writeAgentFile();
+    hubRegister();
     startHeartbeat();
 
     const cleanup = () => {
       if (heartbeatTimer) clearInterval(heartbeatTimer);
       removeAgentFile();
+      hubUnregister();
     };
     process.on('exit', cleanup);
     process.on('SIGTERM', () => { cleanup(); process.exit(0); });
@@ -1642,6 +2050,7 @@ if (process.argv.includes('--capture-prompt')) {
     console.error(`[Mevoric] Agent ID: ${agentId}`);
     console.error(`[Mevoric] Data dir: ${DATA_DIR}`);
     console.error(`[Mevoric] Memory server: ${MEMORY_SERVER_URL}`);
+    console.error(`[Mevoric] Hub: ${HUB_URL || '(none — local only)'}`);
   }
 
   main().catch(err => {

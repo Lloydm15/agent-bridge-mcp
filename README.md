@@ -49,13 +49,13 @@ Without a memory server configured, the 9 bridge/context/checkpoint tools still 
 Set the server URL during init:
 
 ```bash
-npx mevoric init --server http://192.168.2.100:4000
+npx mevoric init --server http://your-memory-server:port
 ```
 
 Or set it as an environment variable:
 
 ```
-MEVORIC_SERVER_URL=http://192.168.2.100:4000
+MEVORIC_SERVER_URL=http://your-memory-server:port
 ```
 
 ## Environment Variables
