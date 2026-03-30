@@ -258,13 +258,16 @@ function getActiveAgents() {
 
 async function callOllama(userMessage, systemPrompt) {
   try {
+    // Prepend /no_think to disable qwen3's reasoning mode — we want a direct answer
+    const fullSystem = '/no_think\n' + systemPrompt;
+    console.log(`[Auto-Respond] Calling Ollama (${OLLAMA_MODEL})...`);
     const resp = await fetch(`${OLLAMA_URL}/api/chat`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         model: OLLAMA_MODEL,
         messages: [
-          { role: 'system', content: systemPrompt },
+          { role: 'system', content: fullSystem },
           { role: 'user', content: userMessage }
         ],
         stream: false,
@@ -272,7 +275,9 @@ async function callOllama(userMessage, systemPrompt) {
       })
     });
     const data = await resp.json();
-    return data.message?.content || null;
+    const content = data.message?.content || '';
+    console.log(`[Auto-Respond] Ollama returned ${content.length} chars`);
+    return content || null;
   } catch (err) {
     console.error(`[Auto-Respond] Ollama call failed: ${err.message}`);
     return null;
@@ -301,6 +306,7 @@ function getRecentConversation(agentA, agentB, limit = 6) {
 }
 
 async function tryAutoRespond(msg) {
+  console.log(`[Auto-Respond] Triggered for message ${msg.id} (to: ${msg.toName || msg.to}, enabled: ${AUTO_RESPOND_ENABLED})`);
   if (!AUTO_RESPOND_ENABLED) return;
   if (msg.broadcast) return;
 
@@ -310,9 +316,10 @@ async function tryAutoRespond(msg) {
   // Check if the message was already read (consumed from the queue)
   const stillPending = messages.find(m => m.id === msg.id);
   if (!stillPending) {
-    // The real agent picked it up — no need for auto-response
+    console.log(`[Auto-Respond] Message ${msg.id} already consumed — skipping`);
     return;
   }
+  console.log(`[Auto-Respond] Message still pending after ${AUTO_RESPOND_DELAY_MS}ms — generating response`);
 
   // Find the target agent's info
   let targetAgent = null;
