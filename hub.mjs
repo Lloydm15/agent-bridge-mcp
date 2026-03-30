@@ -256,32 +256,45 @@ function getActiveAgents() {
 // it within 8 seconds, Ollama generates a response on their behalf
 // ============================================================
 
+// Queue to prevent multiple Ollama calls from piling up on the GPU
+let ollamaQueue = Promise.resolve();
+
 async function callOllama(userMessage, systemPrompt) {
-  try {
-    // Prepend /no_think to disable qwen3's reasoning mode — we want a direct answer
-    const fullSystem = '/no_think\n' + systemPrompt;
-    console.log(`[Auto-Respond] Calling Ollama (${OLLAMA_MODEL})...`);
-    const resp = await fetch(`${OLLAMA_URL}/api/chat`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: OLLAMA_MODEL,
-        messages: [
-          { role: 'system', content: fullSystem },
-          { role: 'user', content: userMessage }
-        ],
-        stream: false,
-        options: { num_predict: 512 }
-      })
+  // Chain requests so they run one at a time instead of all at once
+  const result = new Promise((resolve) => {
+    ollamaQueue = ollamaQueue.then(async () => {
+      try {
+        const fullSystem = '/no_think\n' + systemPrompt;
+        console.log(`[Auto-Respond] Calling Ollama (${OLLAMA_MODEL})...`);
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 45000); // 45 second max
+        const resp = await fetch(`${OLLAMA_URL}/api/chat`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          signal: controller.signal,
+          body: JSON.stringify({
+            model: OLLAMA_MODEL,
+            messages: [
+              { role: 'system', content: fullSystem },
+              { role: 'user', content: userMessage }
+            ],
+            stream: false,
+            options: { num_predict: 256 }
+          })
+        });
+        clearTimeout(timeout);
+        const data = await resp.json();
+        const content = data.message?.content || '';
+        console.log(`[Auto-Respond] Ollama returned ${content.length} chars`);
+        resolve(content || null);
+      } catch (err) {
+        const reason = err.name === 'AbortError' ? 'timed out after 45s' : err.message;
+        console.error(`[Auto-Respond] Ollama call failed: ${reason}`);
+        resolve(null);
+      }
     });
-    const data = await resp.json();
-    const content = data.message?.content || '';
-    console.log(`[Auto-Respond] Ollama returned ${content.length} chars`);
-    return content || null;
-  } catch (err) {
-    console.error(`[Auto-Respond] Ollama call failed: ${err.message}`);
-    return null;
-  }
+  });
+  return result;
 }
 
 function getProjectKnowledge(project, limit = 5) {
