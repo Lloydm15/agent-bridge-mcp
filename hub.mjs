@@ -42,6 +42,7 @@ const KNOWLEDGE_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days knowledge expiry
 // Persistence directory (same dir as hub.mjs)
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const KNOWLEDGE_FILE = resolve(__dirname, 'knowledge.json');
+const MESSAGE_LOG_FILE = resolve(__dirname, 'message-log.json');
 
 // ============================================================
 // In-memory stores
@@ -53,6 +54,9 @@ const messages = [];        // [{ id, from, fromName, to, toName, broadcast, con
 // Knowledge store — per-project namespaces with provenance and verification
 // Design: Memori namespaces (GibsonAI) + Collaborative Memory provenance (arXiv:2505.18279)
 const knowledge = new Map(); // knowledgeId -> { id, content, project, createdBy:{agent,project,host}, source, timestamp, shared, sharedWith[], verifications[] }
+
+// Message history — permanent log of all messages (survives delivery/expiry)
+let messageHistory = [];
 
 // ============================================================
 // Knowledge Persistence — survives hub restarts
@@ -86,6 +90,38 @@ function markKnowledgeDirty() {
 
 // Load on startup
 loadKnowledge();
+
+// ============================================================
+// Message History Persistence — permanent log of all messages
+// ============================================================
+
+function loadMessageHistory() {
+  try {
+    messageHistory = JSON.parse(readFileSync(MESSAGE_LOG_FILE, 'utf8'));
+    console.log(`[Mevoric Hub] Loaded ${messageHistory.length} message history entries from disk`);
+  } catch {
+    // No file yet — start fresh
+  }
+}
+
+function saveMessageHistory() {
+  try {
+    writeFileSync(MESSAGE_LOG_FILE, JSON.stringify(messageHistory, null, 2));
+  } catch (err) {
+    console.error(`[Mevoric Hub] Failed to save message history: ${err.message}`);
+  }
+}
+
+function logMessage(msg) {
+  messageHistory.push({ ...msg });
+  // Cap at 5000 entries to prevent unbounded growth
+  if (messageHistory.length > 5000) {
+    messageHistory = messageHistory.slice(-5000);
+  }
+  saveMessageHistory();
+}
+
+loadMessageHistory();
 
 // ============================================================
 // Cleanup timer — remove dead agents and expired messages
@@ -249,6 +285,7 @@ const server = createServer(async (req, res) => {
         timestamp: new Date().toISOString()
       };
       messages.push(msg);
+      logMessage(msg);
       return json(res, { sent: true, messageId: msg.id });
     }
 
@@ -272,7 +309,34 @@ const server = createServer(async (req, res) => {
         timestamp: new Date().toISOString()
       };
       messages.push(msg);
+      logMessage(msg);
       return json(res, { sent: true, messageId: msg.id });
+    }
+
+    // GET /api/messages/log — browse message history
+    if (method === 'GET' && path === '/api/messages/log') {
+      const limit = parseInt(url.searchParams.get('limit') || '100', 10);
+      const sorted = [...messageHistory].sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp)).slice(0, limit);
+      return json(res, { messages: sorted, count: sorted.length, total: messageHistory.length });
+    }
+
+    // DELETE /api/messages/log/:id — delete a specific message from history
+    if (method === 'DELETE' && path.startsWith('/api/messages/log/')) {
+      const msgId = path.split('/api/messages/log/')[1];
+      const before = messageHistory.length;
+      messageHistory = messageHistory.filter(m => m.id !== msgId);
+      if (messageHistory.length === before) {
+        return json(res, { error: 'Message not found' }, 404);
+      }
+      saveMessageHistory();
+      return json(res, { deleted: true, id: msgId });
+    }
+
+    // DELETE /api/messages/log — clear all message history
+    if (method === 'DELETE' && path === '/api/messages/log') {
+      messageHistory = [];
+      saveMessageHistory();
+      return json(res, { deleted: true, cleared: true });
     }
 
     // GET /api/messages/:agentId?since=ISO&name=agentName
@@ -489,6 +553,7 @@ const server = createServer(async (req, res) => {
         status: 'ok',
         agents: agents.size,
         messages: messages.length,
+        messageHistory: messageHistory.length,
         knowledge: knowledge.size,
         uptime: process.uptime()
       });
