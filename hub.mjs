@@ -52,6 +52,12 @@ const DEAD_MS = 300000;   // 5min without heartbeat = dead, auto-removed
 const MSG_TTL_MS = 3600000; // 1 hour message expiry
 const KNOWLEDGE_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days knowledge expiry
 
+// Auto-responder — makes agents answer each other without human intervention
+const AUTO_RESPOND_ENABLED = process.env.MEVORIC_AUTO_RESPOND !== 'false'; // on by default
+const AUTO_RESPOND_DELAY_MS = 8000; // wait 8 seconds before generating a response
+const OLLAMA_URL = process.env.OLLAMA_URL || 'http://192.168.2.169:11434';
+const OLLAMA_MODEL = process.env.OLLAMA_MODEL || 'qwen3:14b';
+
 // Persistence directory (same dir as hub.mjs)
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const KNOWLEDGE_FILE = resolve(__dirname, 'knowledge.json');
@@ -246,6 +252,126 @@ function getActiveAgents() {
 }
 
 // ============================================================
+// Auto-responder — when an agent gets a message and nobody reads
+// it within 8 seconds, Ollama generates a response on their behalf
+// ============================================================
+
+async function callOllama(userMessage, systemPrompt) {
+  try {
+    const resp = await fetch(`${OLLAMA_URL}/api/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: OLLAMA_MODEL,
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userMessage }
+        ],
+        stream: false,
+        options: { num_predict: 512 }
+      })
+    });
+    const data = await resp.json();
+    return data.message?.content || null;
+  } catch (err) {
+    console.error(`[Auto-Respond] Ollama call failed: ${err.message}`);
+    return null;
+  }
+}
+
+function getProjectKnowledge(project, limit = 5) {
+  const items = [...knowledge.values()]
+    .filter(k => k.project === project)
+    .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp))
+    .slice(0, limit);
+  return items.map(k => k.content).join('\n---\n');
+}
+
+// Get recent message history between two agents for conversation context
+function getRecentConversation(agentA, agentB, limit = 6) {
+  const relevant = messageHistory
+    .filter(m =>
+      (m.from === agentA && m.to === agentB) ||
+      (m.from === agentB && m.to === agentA) ||
+      (m.fromName === agentA && (m.to === agentB || m.toName === agentB)) ||
+      (m.fromName === agentB && (m.to === agentA || m.toName === agentA))
+    )
+    .slice(-limit);
+  return relevant;
+}
+
+async function tryAutoRespond(msg) {
+  if (!AUTO_RESPOND_ENABLED) return;
+  if (msg.broadcast) return;
+
+  // Wait before responding — give the real agent a chance to answer
+  await new Promise(r => setTimeout(r, AUTO_RESPOND_DELAY_MS));
+
+  // Check if the message was already read (consumed from the queue)
+  const stillPending = messages.find(m => m.id === msg.id);
+  if (!stillPending) {
+    // The real agent picked it up — no need for auto-response
+    return;
+  }
+
+  // Find the target agent's info
+  let targetAgent = null;
+  for (const agent of agents.values()) {
+    if (agent.id === msg.to || agent.name === msg.toName ||
+        agent.baseName === msg.toName) {
+      targetAgent = agent;
+      break;
+    }
+  }
+
+  const agentName = targetAgent?.name || msg.toName || 'unknown';
+  const agentProject = targetAgent?.project || 'unknown';
+  const senderName = msg.fromName || msg.from || 'unknown';
+
+  // Gather context: project knowledge + recent conversation
+  const projectKnowledge = getProjectKnowledge(agentProject);
+  const recentChat = getRecentConversation(
+    msg.from || msg.fromName,
+    msg.to || msg.toName
+  );
+  const chatHistory = recentChat
+    .map(m => `${m.fromName || m.from}: ${m.content}`)
+    .join('\n');
+
+  const systemPrompt = `You are ${agentName}, an AI agent working on the ${agentProject} project.
+You are having a conversation with ${senderName}.
+Keep your responses concise and helpful. If you don't have enough context to answer, say so.
+Do NOT use markdown formatting. Write plain text only.
+${projectKnowledge ? `\nThings you know about your project:\n${projectKnowledge}` : ''}
+${chatHistory ? `\nRecent conversation:\n${chatHistory}` : ''}`;
+
+  console.log(`[Auto-Respond] Generating reply from ${agentName} to ${senderName}...`);
+  const response = await callOllama(msg.content, systemPrompt);
+
+  if (!response) {
+    console.log(`[Auto-Respond] No response generated (Ollama may be unavailable)`);
+    return;
+  }
+
+  // Store the reply as a message from the target back to the sender
+  const replyMsg = {
+    id: `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    from: targetAgent?.id || msg.to,
+    fromName: agentName,
+    to: msg.from,
+    toName: msg.fromName,
+    broadcast: false,
+    content: response,
+    project: agentProject,
+    timestamp: new Date().toISOString(),
+    autoGenerated: true
+  };
+  messages.push(replyMsg);
+  logMessage(replyMsg);
+  console.log(`[Auto-Respond] Reply sent from ${agentName} → ${senderName} (${response.length} chars)`);
+}
+
+// ============================================================
 // Request handler
 // ============================================================
 
@@ -336,6 +462,12 @@ const server = createServer(async (req, res) => {
       };
       messages.push(msg);
       logMessage(msg);
+
+      // Kick off auto-response in the background (don't block the response)
+      tryAutoRespond(msg).catch(err =>
+        console.error(`[Auto-Respond] Error: ${err.message}`)
+      );
+
       return json(res, { sent: true, messageId: msg.id });
     }
 
