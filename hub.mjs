@@ -196,19 +196,22 @@ const server = createServer(async (req, res) => {
     // POST /api/agents/register
     if (method === 'POST' && path === '/api/agents/register') {
       const body = await readBody(req);
-      const { id, name, baseName, project, cwd, pid, host, startedAt } = body;
+      const { id, name, baseName, project, cwd, pid, ppid, host, sessionId, startedAt } = body;
 
       if (!id) return json(res, { error: 'id is required' }, 400);
 
+      const existing = agents.get(id);
       agents.set(id, {
         id,
-        name: name || null,
+        name: name || (existing && existing.name) || null,
         baseName: baseName || name || null,
         project: project || null,
         cwd: cwd || null,
         pid: pid || null,
+        ppid: ppid || (existing && existing.ppid) || null,
         host: host || null,
-        startedAt: startedAt || new Date().toISOString(),
+        sessionId: sessionId || (existing && existing.sessionId) || null,
+        startedAt: startedAt || (existing && existing.startedAt) || new Date().toISOString(),
         lastHeartbeat: new Date().toISOString()
       });
 
@@ -466,6 +469,18 @@ const server = createServer(async (req, res) => {
         verdict,
         verificationSummary: summarizeVerifications(item.verifications)
       });
+    }
+
+    // DELETE /api/knowledge/:id — delete a knowledge item
+    if (method === 'DELETE' && path.match(/^\/api\/knowledge\/[^/]+$/) && !path.includes('/shared')) {
+      const id = path.split('/').pop();
+      if (!knowledge.has(id)) {
+        return json(res, { error: 'Knowledge not found' }, 404);
+      }
+      knowledge.delete(id);
+      markKnowledgeDirty();
+      saveKnowledge();
+      return json(res, { deleted: true, id });
     }
 
     // Health check

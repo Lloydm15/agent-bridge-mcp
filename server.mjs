@@ -27,7 +27,7 @@ import {
   readdirSync, unlinkSync, renameSync, appendFileSync
 } from 'fs';
 import { resolve, dirname } from 'path';
-import { randomBytes, randomUUID } from 'crypto';
+import { randomBytes, randomUUID, createHash } from 'crypto';
 import { spawn } from 'child_process';
 import { homedir, tmpdir, platform, hostname } from 'os';
 
@@ -65,7 +65,7 @@ const HUB_URL = process.env.MEVORIC_HUB_URL || null;
 // Memory server (newcode backend)
 const MEMORY_SERVER_URL = process.env.MEVORIC_SERVER_URL
   || process.env.NEWCODE_SERVER_URL
-  || 'http://192.168.2.100:4000';
+  || 'http://192.168.2.100:3100';
 
 // Session-level conversation ID for memory tools
 const sessionConversationId = randomUUID();
@@ -82,9 +82,56 @@ try { writeFileSync(CONVID_FILE, sessionConversationId); } catch {}
 // Agent State (in-memory, per-process)
 // ============================================================
 
-const agentId = `agent-${randomBytes(3).toString('hex')}`;
-let agentName = process.env.MEVORIC_AGENT_NAME || process.env.AGENT_BRIDGE_NAME || null;
+// Deterministic agentId based on parent PID so it survives MCP server restarts
+const agentId = `agent-${createHash('md5').update(String(process.ppid)).digest('hex').slice(0, 6)}`;
+
+// ── Project & Agent Name Mapping ─────────────────────────
+// Only Lloyd's real projects get proper names. Everything else is ignored.
+const PROJECT_MAP = {
+  'NovaStreamLive': { project: 'NovaStreamLive', agent: 'nova' },
+  'Emergence':      { project: 'Emergence',      agent: 'emergence' },
+  'Cortex':         { project: 'Cortex',          agent: 'cortex' },
+  'Clonebot':       { project: 'Clonebot',        agent: 'clonebot' },
+  'Mevoric':        { project: 'Mevoric',         agent: 'mevoric' },
+  'WeFixPodcasts':  { project: 'WeFixPodcasts',   agent: 'wfp' },
+  'lloyd':          { project: 'Abyss',           agent: 'abyss' },
+};
+
+function resolveProjectInfo() {
+  const folderName = process.cwd().split(/[\\/]/).pop();
+  return PROJECT_MAP[folderName] || null;
+}
+
+const projectInfo = resolveProjectInfo();
+const resolvedProject = projectInfo?.project || null;
+const resolvedAgentBase = projectInfo?.agent || null;
+
+// PROJECT_MAP agent base takes priority over env var (env var is legacy)
+let agentName = resolvedAgentBase || process.env.MEVORIC_AGENT_NAME || process.env.AGENT_BRIDGE_NAME;
 let agentBaseName = agentName;
+let agentSessionId = null;
+
+// ── Slug generator — turns first prompt into a short descriptive name ──
+const STOP_WORDS = new Set([
+  'a','an','the','is','it','its','in','on','at','to','for','of','and','or',
+  'but','this','that','with','from','by','as','be','was','were','been','are',
+  'do','does','did','have','has','had','can','could','will','would','should',
+  'may','might','i','me','my','we','our','you','your','he','she','they','them',
+  'what','how','why','when','where','which','who','just','also','so','very',
+  'really','please','hey','hi','ok','yeah','yes','no','not','dont','im','ive',
+  'weve','lets','gonna','wanna','gotta','thats','whats','hows','about','like',
+  'some','all','any','up','out','get','got','put','make','made','take','need',
+  'want','going','been','being','thing','things','stuff'
+]);
+
+function generateSlug(text) {
+  const words = text.toLowerCase()
+    .replace(/[^a-z0-9\s]/g, ' ')   // strip punctuation
+    .split(/\s+/)                     // split on whitespace
+    .filter(w => w.length > 1 && !STOP_WORDS.has(w));
+  const slug = words.slice(0, 4).join('-');
+  return slug.slice(0, 30) || 'session';
+}
 const startedAt = new Date().toISOString();
 let lastReadTimestamp = Date.now();
 let lastHubReadTimestamp = Date.now();
@@ -124,9 +171,11 @@ function getAgentData() {
     id: agentId,
     name: agentName,
     baseName: agentBaseName || agentName,
-    project: process.cwd().split(/[\\/]/).pop(),
+    project: (resolvedProject || process.cwd().split(/[\\/]/).pop()),
     cwd: process.cwd(),
     pid: process.pid,
+    ppid: process.ppid,
+    sessionId: agentSessionId || null,
     startedAt,
     lastHeartbeat: new Date().toISOString()
   };
@@ -226,8 +275,23 @@ function cleanOldMessages() {
 // Heartbeat
 // ============================================================
 
+function syncNameFromDisk() {
+  // The naming hook writes descriptive names (with ':') to the agent file on disk.
+  // If the disk has a better name than our in-memory name, adopt it.
+  try {
+    const diskData = readAgentFile(resolve(AGENTS_DIR, `${agentId}.json`));
+    if (diskData && diskData.name && diskData.name.includes(':') && !agentName.includes(':')) {
+      agentName = diskData.name;
+    }
+    if (diskData && diskData.sessionId && !agentSessionId) {
+      agentSessionId = diskData.sessionId;
+    }
+  } catch {}
+}
+
 function startHeartbeat() {
   heartbeatTimer = setInterval(() => {
+    syncNameFromDisk();
     writeAgentFile();
     hubRegister(); // heartbeat to hub
     cleanOldMessages();
@@ -253,7 +317,7 @@ function writeMessage(to, toName, content, isBroadcast) {
     toName: isBroadcast ? null : toName,
     broadcast: isBroadcast,
     content,
-    project: process.cwd().split(/[\\/]/).pop(),
+    project: (resolvedProject || process.cwd().split(/[\\/]/).pop()),
     timestamp: new Date(now).toISOString()
   };
 
@@ -411,10 +475,12 @@ function hubRegister() {
     id: agentId,
     name: agentName,
     baseName: agentBaseName || agentName,
-    project: process.cwd().split(/[\\/]/).pop(),
+    project: (resolvedProject || process.cwd().split(/[\\/]/).pop()),
     cwd: process.cwd(),
     pid: process.pid,
+    ppid: process.ppid,
     host: hostname(),
+    sessionId: agentSessionId || null,
     startedAt
   }).catch(() => {});
 }
@@ -452,7 +518,7 @@ async function handleRegister(args) {
     id: agentId,
     name: agentName,
     baseName: name,
-    project: process.cwd().split(/[\\/]/).pop(),
+    project: (resolvedProject || process.cwd().split(/[\\/]/).pop()),
     cwd: process.cwd(),
     pid: process.pid,
     ...(finalName !== name ? { note: `Name "${name}" was taken, registered as "${finalName}"` } : {})
@@ -497,17 +563,64 @@ async function handleSendMessage(args) {
 
   const msg = writeMessage(target.id, target.name, content, false);
   // Also send via hub for cross-machine delivery
+  const project = resolvedProject || process.cwd().split(/[\\/]/).pop();
   hubFetch('POST', '/api/messages', {
     from: agentId, fromName: agentName,
     to: target.id, toName: target.name,
-    content, project: process.cwd().split(/[\\/]/).pop()
+    content, project
   }).catch(() => {});
-  return {
+
+  // Poll for a reply from the target agent (up to 30s, check every 3s)
+  const sentAt = Date.now();
+  const maxWait = 30000;
+  const pollInterval = 3000;
+  let reply = null;
+
+  while (Date.now() - sentAt < maxWait) {
+    await new Promise(r => setTimeout(r, pollInterval));
+
+    // Check local messages for a reply from the target
+    const localNew = readNewMessages(false);
+    const fromTarget = localNew.find(m =>
+      (m.from === target.id || m.fromName === target.name) && !m.broadcast
+    );
+    if (fromTarget) { reply = fromTarget; break; }
+
+    // Check hub for cross-machine replies
+    const hubResult = await hubFetch('GET',
+      `/api/messages/${agentId}?name=${encodeURIComponent(agentName || '')}&since=${new Date(lastHubReadTimestamp).toISOString()}`
+    );
+    if (hubResult && hubResult.messages) {
+      const fromTargetHub = hubResult.messages.find(m =>
+        (m.from === target.id || m.fromName === target.name) && !m.broadcast
+      );
+      if (fromTargetHub) {
+        lastHubReadTimestamp = Date.now();
+        reply = fromTargetHub;
+        break;
+      }
+    }
+  }
+
+  const result = {
     sent: true,
     messageId: msg.id,
     to: { id: target.id, name: target.name },
     timestamp: msg.timestamp
   };
+
+  if (reply) {
+    result.reply = {
+      from: reply.fromName || reply.from,
+      content: reply.content,
+      timestamp: reply.timestamp
+    };
+  } else {
+    result.reply = null;
+    result.note = 'No reply received within 30 seconds — the other agent may respond later';
+  }
+
+  return result;
 }
 
 async function handleReadMessages(args) {
@@ -543,7 +656,7 @@ async function handleBroadcast(args) {
   // Also broadcast via hub
   hubFetch('POST', '/api/messages/broadcast', {
     from: agentId, fromName: agentName,
-    content, project: process.cwd().split(/[\\/]/).pop()
+    content, project: (resolvedProject || process.cwd().split(/[\\/]/).pop())
   }).catch(() => {});
 
   return {
@@ -563,7 +676,7 @@ async function handleStoreKnowledge(args) {
   const { content, source } = args;
   if (!content) return { error: 'content is required — what fact or finding are you storing?' };
 
-  const project = process.cwd().split(/[\\/]/).pop();
+  const project = (resolvedProject || process.cwd().split(/[\\/]/).pop());
   const result = await hubFetch('POST', '/api/knowledge', {
     content,
     project,
@@ -579,7 +692,7 @@ async function handleStoreKnowledge(args) {
 
 async function handleQueryKnowledge(args) {
   const { project: targetProject, search, shared_only } = args;
-  const myProject = process.cwd().split(/[\\/]/).pop();
+  const myProject = (resolvedProject || process.cwd().split(/[\\/]/).pop());
 
   let path;
   if (shared_only) {
@@ -617,7 +730,7 @@ async function handleVerifyKnowledge(args) {
     return { error: 'verdict must be "confirmed" or "challenged"' };
   }
 
-  const project = process.cwd().split(/[\\/]/).pop();
+  const project = (resolvedProject || process.cwd().split(/[\\/]/).pop());
   const result = await hubFetch('POST', `/api/knowledge/${id}/verify`, {
     agent: agentName,
     project,
@@ -640,7 +753,7 @@ function writeContextFile(name, content, uniqueId) {
     agentName: name,
     agentId: uniqueId || agentId,
     baseName: name,
-    project: process.cwd().split(/[\\/]/).pop(),
+    project: (resolvedProject || process.cwd().split(/[\\/]/).pop()),
     updatedAt: new Date().toISOString(),
     content
   }, null, 2);
@@ -683,7 +796,7 @@ async function handleShareContext(args) {
   return {
     shared: true,
     agentName,
-    project: process.cwd().split(/[\\/]/).pop(),
+    project: (resolvedProject || process.cwd().split(/[\\/]/).pop()),
     updatedAt: new Date().toISOString(),
     contentLength: content.length
   };
@@ -809,7 +922,7 @@ function writeCheckpointFile(name, sessionId, checkpointData) {
   const data = JSON.stringify({
     version: 1,
     agentName: name,
-    project: process.cwd().split(/[\\/]/).pop(),
+    project: (resolvedProject || process.cwd().split(/[\\/]/).pop()),
     sessionId: suffix,
     createdAt: new Date().toISOString(),
     ...checkpointData
@@ -825,7 +938,7 @@ function writeCheckpointFile(name, sessionId, checkpointData) {
   return targetPath;
 }
 
-function readLatestCheckpoint(name) {
+function readLatestCheckpoint(name, excludeSessionId = null) {
   const safeName = name.replace(/[^a-zA-Z0-9_-]/g, '_').toLowerCase();
   let files;
   try {
@@ -840,6 +953,8 @@ function readLatestCheckpoint(name) {
     if (basePart === safeName) {
       try {
         const data = JSON.parse(readFileSync(resolve(CHECKPOINTS_DIR, file), 'utf8'));
+        // Skip checkpoints from the current session (don't load your own)
+        if (excludeSessionId && data.sessionId === excludeSessionId) continue;
         matches.push(data);
       } catch { continue; }
     }
@@ -847,12 +962,19 @@ function readLatestCheckpoint(name) {
 
   if (matches.length === 0) return null;
 
-  matches.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+  // Prefer rich checkpoints (manually saved or with real content) over auto prompt-only ones
+  // Rich = has steps_completed or key_decisions filled in
+  const rich = matches.filter(m =>
+    (m.task?.steps_completed?.length > 0) || (m.key_decisions?.length > 0) || !m.auto
+  );
+  const pool = rich.length > 0 ? rich : matches;
 
-  const age = Date.now() - new Date(matches[0].createdAt).getTime();
+  pool.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+
+  const age = Date.now() - new Date(pool[0].createdAt).getTime();
   if (age > CHECKPOINT_MAX_AGE_MS) return null;
 
-  return matches[0];
+  return pool[0];
 }
 
 async function handleSaveCheckpoint(args) {
@@ -870,7 +992,7 @@ async function handleSaveCheckpoint(args) {
   return {
     saved: true,
     agentName,
-    project: process.cwd().split(/[\\/]/).pop(),
+    project: (resolvedProject || process.cwd().split(/[\\/]/).pop()),
     createdAt: new Date().toISOString(),
     path
   };
@@ -901,7 +1023,7 @@ async function handleRetrieveMemories(args) {
   const query = args.query;
   if (!query) return { error: 'query is required' };
   const userId = args.user_id || 'lloyd';
-  const project = process.cwd().split(/[\\/]/).pop();
+  const project = (resolvedProject || process.cwd().split(/[\\/]/).pop());
 
   const SCORE_THRESHOLD = 0.25;
   const MAX_RESULTS = 10;
@@ -951,7 +1073,7 @@ async function handleStoreConversation(args) {
   }
   const userId = args.user_id || 'lloyd';
   const convId = args.conversation_id || sessionConversationId;
-  const project = process.cwd().split(/[\\/]/).pop();
+  const project = (resolvedProject || process.cwd().split(/[\\/]/).pop());
 
   try {
     const data = await memoryFetch('/ingest', {
@@ -1130,6 +1252,8 @@ async function handleJudgeMemories(args) {
 // ============================================================
 
 function resolveAgentName(cwd) {
+  // PROJECT_MAP takes priority — env vars are legacy
+  if (resolvedAgentBase) return resolvedAgentBase;
   if (process.env.MEVORIC_AGENT_NAME) return process.env.MEVORIC_AGENT_NAME;
   if (process.env.AGENT_BRIDGE_NAME) return process.env.AGENT_BRIDGE_NAME;
 
@@ -1137,7 +1261,6 @@ function resolveAgentName(cwd) {
     const mcpPath = resolve(cwd, '.mcp.json');
     try {
       const mcp = JSON.parse(readFileSync(mcpPath, 'utf8'));
-      // Check both mevoric and legacy agent-bridge entries
       const entry = mcp.mcpServers?.['mevoric'] || mcp.mcpServers?.['agent-bridge'];
       const name = entry?.env?.MEVORIC_AGENT_NAME || entry?.env?.AGENT_BRIDGE_NAME;
       if (name) return name;
@@ -1525,10 +1648,104 @@ async function runCapturePrompt() {
   const clean = stripSystemTags(prompt);
   if (clean.length < 5) process.exit(0);
 
-  // Append to JSONL file (one line per prompt, accumulates across the session)
+  // Check if this is the first prompt (JSONL file doesn't exist yet)
   const tmp = tmpdir();
+  const promptFilePath = resolve(tmp, `mevoric-prompt-${sessionId}`);
+  const isFirstPrompt = !existsSync(promptFilePath);
+
+  // Append to JSONL file (one line per prompt, accumulates across the session)
   const entry = JSON.stringify({ ts: Date.now(), prompt: clean });
-  appendFileSync(resolve(tmp, `mevoric-prompt-${sessionId}`), entry + '\n', 'utf8');
+  appendFileSync(promptFilePath, entry + '\n', 'utf8');
+
+  // --- First-prompt naming: rename agent from "abyss-3" to "abyss:fix-blurry-wan" ---
+  if (isFirstPrompt && clean.length >= 5) {
+    try {
+      ensureDirs();
+      const baseName = resolvedAgentBase || process.env.MEVORIC_AGENT_NAME || process.env.AGENT_BRIDGE_NAME;
+      if (baseName) {
+        const slug = generateSlug(clean);
+        const descriptiveName = `${baseName}:${slug}`;
+
+        // Find our agent file via breadcrumb (preferred) or ppid fallback
+        const cwd = process.cwd();
+        let foundAgentId = null;
+        try {
+          foundAgentId = readFileSync(resolve(tmp, `mevoric-agent-ppid-${process.ppid}`), 'utf8').trim();
+        } catch {}
+        // Fallback: scan agent files for matching ppid
+        if (!foundAgentId) {
+          const files = readdirSync(AGENTS_DIR).filter(f => f.endsWith('.json'));
+          for (const file of files) {
+            const ad = readAgentFile(resolve(AGENTS_DIR, file));
+            if (ad && ad.ppid === process.ppid) { foundAgentId = ad.id; break; }
+          }
+        }
+        if (foundAgentId) {
+          const agentPath = resolve(AGENTS_DIR, `${foundAgentId}.json`);
+          const agentData = readAgentFile(agentPath);
+          if (agentData) {
+            agentData.name = descriptiveName;
+            agentData.sessionId = sessionId;
+            const tmpAgent = agentPath + '.tmp';
+            writeFileSync(tmpAgent, JSON.stringify(agentData, null, 2));
+            renameSync(tmpAgent, agentPath);
+          }
+        }
+
+        // Re-register with hub under the new descriptive name
+        const hubUrl = process.env.MEVORIC_HUB_URL || process.env.AGENT_BRIDGE_HUB_URL || null;
+        if (hubUrl) {
+          const controller = new AbortController();
+          const timer = setTimeout(() => controller.abort(), 3000);
+          fetch(`${hubUrl}/api/agents/register`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              id: foundAgentId || `capture-${sessionId.slice(0, 8)}`,
+              name: descriptiveName,
+              baseName,
+              project: (resolvedProject || process.cwd().split(/[\\/]/).pop()),
+              cwd,
+              pid: process.ppid,
+              ppid: process.ppid,
+              host: hostname(),
+              sessionId,
+              startedAt: new Date().toISOString()
+            }),
+            signal: controller.signal
+          }).catch(() => {});
+          clearTimeout(timer);
+        }
+      }
+    } catch {} // Best-effort — naming is cosmetic, don't block
+  }
+
+  // Always store sessionId in the agent file so we can match agents to conversations
+  if (sessionId) {
+    try {
+      let myAgentId = null;
+      try { myAgentId = readFileSync(resolve(tmp, `mevoric-agent-ppid-${process.ppid}`), 'utf8').trim(); } catch {}
+      if (!myAgentId) {
+        ensureDirs();
+        const files = readdirSync(AGENTS_DIR).filter(f => f.endsWith('.json'));
+        for (const file of files) {
+          const ad = readAgentFile(resolve(AGENTS_DIR, file));
+          if (ad && ad.ppid === process.ppid) { myAgentId = ad.id; break; }
+        }
+      }
+      if (myAgentId) {
+        ensureDirs();
+        const agentPath = resolve(AGENTS_DIR, `${myAgentId}.json`);
+        const agentData = readAgentFile(agentPath);
+        if (agentData && !agentData.sessionId) {
+          agentData.sessionId = sessionId;
+          const tmpAgent = agentPath + '.tmp';
+          writeFileSync(tmpAgent, JSON.stringify(agentData, null, 2));
+          renameSync(tmpAgent, agentPath);
+        }
+      }
+    } catch {}
+  }
 
   // Fire-and-forget POST to /ingest so this prompt is saved even if session crashes
   try {
@@ -1536,7 +1753,7 @@ async function runCapturePrompt() {
     try { convId = readFileSync(resolve(tmp, 'mevoric-convid'), 'utf8').trim(); } catch {}
     if (!convId) convId = sessionId;
 
-    const project = process.cwd().split(/[\\/]/).pop();
+    const project = (resolvedProject || process.cwd().split(/[\\/]/).pop());
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 3000);
     await fetch(`${MEMORY_SERVER_URL}/ingest`, {
@@ -1556,7 +1773,7 @@ async function runCapturePrompt() {
   // --- Auto-share live context so other tabs can see what this session is doing ---
   try {
     ensureDirs();
-    const name = process.env.MEVORIC_AGENT_NAME || process.env.AGENT_BRIDGE_NAME || findAgentNameForSession(sessionId);
+    const name = findAgentNameForSession(sessionId) || resolvedAgentBase || process.env.MEVORIC_AGENT_NAME || process.env.AGENT_BRIDGE_NAME;
     if (name) {
       const safeName = name.replace(/[^a-zA-Z0-9_-]/g, '_').toLowerCase();
       const ctxPath = resolve(CONTEXT_DIR, `${safeName}--${sessionId}.json`);
@@ -1578,7 +1795,7 @@ async function runCapturePrompt() {
         const ctxData = JSON.stringify({
           agentName: name,
           baseName: name,
-          project: process.cwd().split(/[\\/]/).pop(),
+          project: (resolvedProject || process.cwd().split(/[\\/]/).pop()),
           updatedAt: new Date().toISOString(),
           sessionId,
           live: true,
@@ -1591,6 +1808,54 @@ async function runCapturePrompt() {
       }
     }
   } catch {} // Best-effort — don't block on context sharing
+
+  // --- Auto-save checkpoint on every prompt so new tabs always have fresh context ---
+  try {
+    ensureDirs();
+    const name = findAgentNameForSession(sessionId) || resolvedAgentBase || process.env.MEVORIC_AGENT_NAME || process.env.AGENT_BRIDGE_NAME;
+    if (name) {
+      // Use BASE name (e.g. "abyss") not numbered name (e.g. "abyss-3")
+      // so any new tab with the same base finds the most recent checkpoint
+      const baseName = resolvedAgentBase || name.split(/[-:]/)[0];
+      const safeBase = baseName.replace(/[^a-zA-Z0-9_-]/g, '_').toLowerCase();
+      const cpPath = resolve(CHECKPOINTS_DIR, `${safeBase}--${sessionId}.json`);
+
+      // Read all prompts so far to build a task summary
+      let prompts = [];
+      try {
+        prompts = readFileSync(promptFilePath, 'utf8')
+          .split('\n').filter(Boolean)
+          .map(line => { try { return JSON.parse(line); } catch { return null; } })
+          .filter(Boolean);
+      } catch {}
+
+      const firstPrompt = prompts.length > 0 ? prompts[0].prompt : clean;
+      const lastPrompt = prompts.length > 0 ? prompts[prompts.length - 1].prompt : clean;
+      const promptSummary = prompts.slice(-5).map(p => p.prompt.slice(0, 200)).join(' | ');
+
+      const cpData = JSON.stringify({
+        version: 1,
+        agentName: name,
+        project: (resolvedProject || process.cwd().split(/[\\/]/).pop()),
+        sessionId,
+        createdAt: new Date().toISOString(),
+        auto: true,
+        live: true,
+        task: {
+          description: firstPrompt.slice(0, 300),
+          status: 'in_progress'
+        },
+        files_touched: [],
+        key_decisions: [],
+        notes: `Live session — last prompt: ${lastPrompt.slice(0, 300)}`,
+        recentPrompts: promptSummary.slice(0, 1000)
+      }, null, 2);
+
+      const cpTmp = cpPath + '.tmp';
+      writeFileSync(cpTmp, cpData);
+      renameSync(cpTmp, cpPath);
+    }
+  } catch {} // Best-effort
 
   process.exit(0);
 }
@@ -1675,7 +1940,7 @@ async function runIngest() {
   const ctxData = JSON.stringify({
     agentName: name,
     baseName: name,
-    project: process.cwd().split(/[\\/]/).pop(),
+    project: (resolvedProject || process.cwd().split(/[\\/]/).pop()),
     updatedAt: new Date().toISOString(),
     sessionId,
     exchanges: existing.exchanges
@@ -1695,7 +1960,7 @@ async function runIngest() {
     const cpData = JSON.stringify({
       version: 1,
       agentName: name,
-      project: process.cwd().split(/[\\/]/).pop(),
+      project: (resolvedProject || process.cwd().split(/[\\/]/).pop()),
       sessionId,
       createdAt: new Date().toISOString(),
       auto: true,
@@ -1707,7 +1972,8 @@ async function runIngest() {
       key_decisions: [],
       notes: cleanAssistant.slice(0, 500)
     }, null, 2);
-    const cpPath = resolve(CHECKPOINTS_DIR, `${safeName}--${sessionId}.json`);
+    const cpBaseName = (resolvedAgentBase || name.split(/[-:]/)[0]).replace(/[^a-zA-Z0-9_-]/g, '_').toLowerCase();
+    const cpPath = resolve(CHECKPOINTS_DIR, `${cpBaseName}--${sessionId}.json`);
     const cpTmp = cpPath + '.tmp';
     writeFileSync(cpTmp, cpData);
     renameSync(cpTmp, cpPath);
@@ -1734,7 +2000,7 @@ async function runIngest() {
       }
       messages.push({ role: 'assistant', content: cleanAssistant.slice(0, 10000) });
 
-      const project = process.cwd().split(/[\\/]/).pop();
+      const project = (resolvedProject || process.cwd().split(/[\\/]/).pop());
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 15000);
       await fetch(`${MEMORY_SERVER_URL}/ingest`, {
@@ -1770,21 +2036,48 @@ async function runIngest() {
     } catch {} // Best-effort
   }
 
-  // --- 5. Broadcast session-end notification (picked up by watcher) ---
+  // --- 5. Broadcast session-end notification to hub (shows on dashboard) ---
   try {
-    mkdirSync(MESSAGES_DIR, { recursive: true });
     const summary = userMsg.slice(0, 100) || 'session ended';
-    const msgData = JSON.stringify({
-      fromName: name,
-      toName: '*',
-      broadcast: true,
-      to: '*',
-      content: `${name} finished: ${summary}`,
-      timestamp: new Date().toISOString()
+    const hubUrl = process.env.MEVORIC_HUB_URL || process.env.AGENT_BRIDGE_HUB_URL || 'http://192.168.2.100:4100';
+    const controller3 = new AbortController();
+    const timer3 = setTimeout(() => controller3.abort(), 5000);
+    await fetch(`${hubUrl}/api/messages/broadcast`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        from: name,
+        fromName: name,
+        content: `${name} finished: ${summary}`,
+      }),
+      signal: controller3.signal
     });
-    const msgFile = resolve(MESSAGES_DIR, `${Date.now()}-${randomBytes(4).toString('hex')}.json`);
-    writeFileSync(msgFile, msgData);
-  } catch {}
+    clearTimeout(timer3);
+  } catch {} // Best-effort
+
+  // --- 6. Auto-store knowledge from session (populates Shared Knowledge on dashboard) ---
+  try {
+    const project = (resolvedProject || process.cwd().split(/[\\/]/).pop());
+    const hubUrl = process.env.MEVORIC_HUB_URL || process.env.AGENT_BRIDGE_HUB_URL || 'http://192.168.2.100:4100';
+    // Build a concise knowledge summary from the session
+    const taskSummary = userMsg.slice(0, 300) || 'session work';
+    const responseSummary = cleanAssistant.slice(0, 500);
+    const controller4 = new AbortController();
+    const timer4 = setTimeout(() => controller4.abort(), 5000);
+    await fetch(`${hubUrl}/api/knowledge`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        content: `${taskSummary}\n\nResult: ${responseSummary}`,
+        agent: name,
+        agentProject: project,
+        project,
+        source: 'auto-session'
+      }),
+      signal: controller4.signal
+    });
+    clearTimeout(timer4);
+  } catch {} // Best-effort
 
   process.exit(0);
 }
@@ -1826,11 +2119,21 @@ async function runCheckMessages() {
     writeCursor(name, newCursor);
   }
 
-  if (messages.length === 0) {
+  // Filter out session summaries — they're just noise in the prompt.
+  // Session-end broadcasts contain "finished:" and are from the ingest hook.
+  const directMessages = messages.filter(m => {
+    const content = m.content || '';
+    const from = m.fromName || m.from || '';
+    // Skip session summaries like "abyss-3 finished: ..."
+    if (content.match(/^[\w-]+ finished:/)) return false;
+    return true;
+  });
+
+  if (directMessages.length === 0) {
     process.exit(0);
   }
 
-  const formatted = messages.map(m => {
+  const formatted = directMessages.map(m => {
     const from = m.fromName || m.from;
     const age = Math.round((Date.now() - new Date(m.timestamp).getTime()) / 1000);
     const ageStr = age < 60 ? `${age}s ago` : `${Math.round(age / 60)}min ago`;
@@ -1840,7 +2143,7 @@ async function runCheckMessages() {
   const output = {
     hookSpecificOutput: {
       hookEventName: data.hook_event_name || 'UserPromptSubmit',
-      additionalContext: `--- INCOMING AGENT MESSAGES (${messages.length}) ---\n${formatted}\n--- END AGENT MESSAGES ---\nYou received ${messages.length} message(s) from other agents. Read and respond to them. Use send_message to reply if needed.`
+      additionalContext: `--- INCOMING AGENT MESSAGES (${directMessages.length}) ---\n${formatted}\n--- END AGENT MESSAGES ---\nYou received ${directMessages.length} message(s) from other agents. Read and respond to them. Use send_message to reply if needed.`
     }
   };
 
@@ -1853,25 +2156,9 @@ async function runCheckMessages() {
 // ============================================================
 
 function ensureWatcherRunning() {
-  const pidFile = resolve(DATA_DIR, 'watcher.pid');
-  try {
-    const pid = parseInt(readFileSync(pidFile, 'utf8').trim(), 10);
-    if (pid && isProcessAlive(pid)) return; // already running
-  } catch {}
-
-  // Spawn watcher as detached background process
-  const watcherPath = resolve(dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Z]:)/, '$1')), 'watcher.mjs');
-  if (!existsSync(watcherPath)) return;
-
-  const child = spawn(process.execPath, [watcherPath], {
-    detached: true,
-    stdio: 'ignore',
-    windowsHide: true,
-  });
-  child.unref();
-
-  // Save PID so we can check next time
-  try { writeFileSync(pidFile, String(child.pid), 'utf8'); } catch {}
+  // Watcher disabled — Cortex dashboard at /mevoric now shows messages.
+  // No more Windows popup notifications needed.
+  return;
 }
 
 async function runBootstrapContext() {
@@ -1938,7 +2225,7 @@ async function runBootstrapContext() {
     writeCursor(myName, newCursor);
   }
 
-  const checkpoint = readLatestCheckpoint(myName);
+  const checkpoint = readLatestCheckpoint(myName, mySessionId);
 
   if (activeAgents.length === 0 && contexts.length === 0 && messages.length === 0 && !checkpoint) {
     process.exit(0);
@@ -2020,7 +2307,20 @@ if (process.argv.includes('--capture-prompt')) {
     ensureDirs();
     cleanOldMessages();
 
-    if (agentName) {
+    // If our agent file already exists (e.g. from a previous MCP server), preserve its name and sessionId
+    try {
+      const existingPath = resolve(AGENTS_DIR, `${agentId}.json`);
+      const onDisk = JSON.parse(readFileSync(existingPath, 'utf8'));
+      if (onDisk.name && onDisk.name.includes(':')) {
+        agentName = onDisk.name;
+      }
+      if (onDisk.sessionId) {
+        agentSessionId = onDisk.sessionId;
+      }
+    } catch {}
+
+    // Only deduplicate if we still have a generic name (no colon = no descriptive slug yet)
+    if (agentName && !agentName.includes(':')) {
       const existing = getAllAgents().filter(a => a.status === 'active' && a.name?.toLowerCase() === agentName.toLowerCase());
       if (existing.length > 0) {
         const allNames = getAllAgents().map(a => a.name?.toLowerCase()).filter(Boolean);
@@ -2031,12 +2331,15 @@ if (process.argv.includes('--capture-prompt')) {
     }
 
     writeAgentFile();
+    // Write breadcrumb so hooks can find our agentId via shared parent PID
+    try { writeFileSync(resolve(tmpdir(), `mevoric-agent-ppid-${process.ppid}`), agentId); } catch {}
     hubRegister();
     startHeartbeat();
 
     const cleanup = () => {
       if (heartbeatTimer) clearInterval(heartbeatTimer);
       removeAgentFile();
+      try { unlinkSync(resolve(tmpdir(), `mevoric-agent-ppid-${process.ppid}`)); } catch {}
       hubUnregister();
     };
     process.on('exit', cleanup);
