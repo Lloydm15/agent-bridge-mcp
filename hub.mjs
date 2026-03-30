@@ -53,15 +53,84 @@ const MSG_TTL_MS = 3600000; // 1 hour message expiry
 const KNOWLEDGE_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days knowledge expiry
 
 // Auto-responder — makes agents answer each other without human intervention
-const AUTO_RESPOND_ENABLED = process.env.MEVORIC_AUTO_RESPOND !== 'false'; // on by default
+let autoRespondEnabled = process.env.MEVORIC_AUTO_RESPOND !== 'false'; // on by default
 const AUTO_RESPOND_DELAY_MS = 8000; // wait 8 seconds before generating a response
 const OLLAMA_URL = process.env.OLLAMA_URL || 'http://192.168.2.169:11434';
 const OLLAMA_MODEL = process.env.OLLAMA_MODEL || 'qwen3:14b';
+let autoRespondDailyLimit = 50; // max auto-responses per day
+
+// Auto-respond tracking
+const autoRespondStats = {
+  enabled: autoRespondEnabled,
+  totalResponses: 0,
+  totalTokensEstimated: 0,
+  todayResponses: 0,
+  todayTokensEstimated: 0,
+  todayDate: new Date().toISOString().slice(0, 10),
+  history: [],          // last 50 responses with timestamps + token counts
+  failedToday: 0,
+  lastResponseAt: null,
+  dailyLimit: autoRespondDailyLimit,
+};
 
 // Persistence directory (same dir as hub.mjs)
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const KNOWLEDGE_FILE = resolve(__dirname, 'knowledge.json');
 const MESSAGE_LOG_FILE = resolve(__dirname, 'message-log.json');
+const AUTO_RESPOND_STATS_FILE = resolve(__dirname, 'auto-respond-stats.json');
+
+// Load persisted stats on startup
+try {
+  const saved = JSON.parse(readFileSync(AUTO_RESPOND_STATS_FILE, 'utf8'));
+  Object.assign(autoRespondStats, saved);
+  autoRespondEnabled = autoRespondStats.enabled;
+  autoRespondDailyLimit = autoRespondStats.dailyLimit;
+  console.log(`[Mevoric Hub] Loaded auto-respond stats: ${autoRespondStats.totalResponses} total, enabled=${autoRespondEnabled}`);
+} catch { /* first run */ }
+
+function saveAutoRespondStats() {
+  try {
+    writeFileSync(AUTO_RESPOND_STATS_FILE, JSON.stringify(autoRespondStats, null, 2));
+  } catch (err) {
+    console.error(`[Mevoric Hub] Failed to save auto-respond stats: ${err.message}`);
+  }
+}
+
+function resetDailyCountsIfNeeded() {
+  const today = new Date().toISOString().slice(0, 10);
+  if (autoRespondStats.todayDate !== today) {
+    autoRespondStats.todayResponses = 0;
+    autoRespondStats.todayTokensEstimated = 0;
+    autoRespondStats.failedToday = 0;
+    autoRespondStats.todayDate = today;
+  }
+}
+
+function recordAutoResponse(fromName, toName, tokensEstimated, success) {
+  resetDailyCountsIfNeeded();
+  if (success) {
+    autoRespondStats.totalResponses++;
+    autoRespondStats.todayResponses++;
+    autoRespondStats.totalTokensEstimated += tokensEstimated;
+    autoRespondStats.todayTokensEstimated += tokensEstimated;
+    autoRespondStats.lastResponseAt = new Date().toISOString();
+    autoRespondStats.history.push({
+      from: fromName,
+      to: toName,
+      tokens: tokensEstimated,
+      timestamp: new Date().toISOString()
+    });
+    // Keep last 50 entries
+    if (autoRespondStats.history.length > 50) {
+      autoRespondStats.history = autoRespondStats.history.slice(-50);
+    }
+  } else {
+    autoRespondStats.failedToday++;
+  }
+  autoRespondStats.enabled = autoRespondEnabled;
+  autoRespondStats.dailyLimit = autoRespondDailyLimit;
+  saveAutoRespondStats();
+}
 
 // ============================================================
 // In-memory stores
@@ -319,9 +388,16 @@ function getRecentConversation(agentA, agentB, limit = 6) {
 }
 
 async function tryAutoRespond(msg) {
-  console.log(`[Auto-Respond] Triggered for message ${msg.id} (to: ${msg.toName || msg.to}, enabled: ${AUTO_RESPOND_ENABLED})`);
-  if (!AUTO_RESPOND_ENABLED) return;
+  console.log(`[Auto-Respond] Triggered for message ${msg.id} (to: ${msg.toName || msg.to}, enabled: ${autoRespondEnabled})`);
+  if (!autoRespondEnabled) return;
   if (msg.broadcast) return;
+
+  // Check daily limit
+  resetDailyCountsIfNeeded();
+  if (autoRespondStats.todayResponses >= autoRespondDailyLimit) {
+    console.log(`[Auto-Respond] Daily limit reached (${autoRespondDailyLimit}) — skipping`);
+    return;
+  }
 
   // Wait before responding — give the real agent a chance to answer
   await new Promise(r => setTimeout(r, AUTO_RESPOND_DELAY_MS));
@@ -370,8 +446,14 @@ ${chatHistory ? `\nRecent conversation:\n${chatHistory}` : ''}`;
 
   if (!response) {
     console.log(`[Auto-Respond] No response generated (Ollama may be unavailable)`);
+    recordAutoResponse(agentName, senderName, 0, false);
     return;
   }
+
+  // Rough token estimate: ~4 chars per token for input+output
+  const inputLen = (systemPrompt.length + msg.content.length);
+  const outputLen = response.length;
+  const tokensEstimated = Math.round((inputLen + outputLen) / 4);
 
   // Store the reply as a message from the target back to the sender
   const replyMsg = {
@@ -388,7 +470,8 @@ ${chatHistory ? `\nRecent conversation:\n${chatHistory}` : ''}`;
   };
   messages.push(replyMsg);
   logMessage(replyMsg);
-  console.log(`[Auto-Respond] Reply sent from ${agentName} → ${senderName} (${response.length} chars)`);
+  recordAutoResponse(agentName, senderName, tokensEstimated, true);
+  console.log(`[Auto-Respond] Reply sent from ${agentName} → ${senderName} (${response.length} chars, ~${tokensEstimated} tokens)`);
 }
 
 // ============================================================
@@ -909,6 +992,56 @@ const server = createServer(async (req, res) => {
       return json(res, { agent, skills: agentSkills, count: agentSkills.length });
     }
 
+    // ============================================================
+    // Auto-Respond Controls
+    // ============================================================
+
+    // GET /api/auto-respond — get current stats and settings
+    if (method === 'GET' && path === '/api/auto-respond') {
+      resetDailyCountsIfNeeded();
+      return json(res, {
+        ...autoRespondStats,
+        enabled: autoRespondEnabled,
+        dailyLimit: autoRespondDailyLimit,
+        model: OLLAMA_MODEL,
+        ollamaUrl: OLLAMA_URL
+      });
+    }
+
+    // POST /api/auto-respond — toggle on/off, set daily limit
+    if (method === 'POST' && path === '/api/auto-respond') {
+      const body = await readBody(req);
+      if (typeof body.enabled === 'boolean') {
+        autoRespondEnabled = body.enabled;
+        autoRespondStats.enabled = autoRespondEnabled;
+        console.log(`[Auto-Respond] ${autoRespondEnabled ? 'ENABLED' : 'DISABLED'} by user`);
+      }
+      if (typeof body.dailyLimit === 'number' && body.dailyLimit >= 0) {
+        autoRespondDailyLimit = body.dailyLimit;
+        autoRespondStats.dailyLimit = autoRespondDailyLimit;
+        console.log(`[Auto-Respond] Daily limit set to ${autoRespondDailyLimit}`);
+      }
+      saveAutoRespondStats();
+      return json(res, {
+        enabled: autoRespondEnabled,
+        dailyLimit: autoRespondDailyLimit,
+        todayResponses: autoRespondStats.todayResponses
+      });
+    }
+
+    // DELETE /api/auto-respond/stats — reset all stats
+    if (method === 'DELETE' && path === '/api/auto-respond/stats') {
+      autoRespondStats.totalResponses = 0;
+      autoRespondStats.totalTokensEstimated = 0;
+      autoRespondStats.todayResponses = 0;
+      autoRespondStats.todayTokensEstimated = 0;
+      autoRespondStats.failedToday = 0;
+      autoRespondStats.history = [];
+      autoRespondStats.lastResponseAt = null;
+      saveAutoRespondStats();
+      return json(res, { reset: true });
+    }
+
     // Health check
     if (method === 'GET' && (path === '/' || path === '/health')) {
       return json(res, {
@@ -919,7 +1052,12 @@ const server = createServer(async (req, res) => {
         knowledge: knowledge.size,
         tasks: tasks.size,
         skills: [...skills.values()].reduce((sum, s) => sum + s.length, 0),
-        uptime: process.uptime()
+        uptime: process.uptime(),
+        autoRespond: {
+          enabled: autoRespondEnabled,
+          todayResponses: autoRespondStats.todayResponses,
+          dailyLimit: autoRespondDailyLimit
+        }
       });
     }
 
