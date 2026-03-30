@@ -55,8 +55,7 @@ const KNOWLEDGE_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days knowledge expiry
 // Auto-responder — makes agents answer each other without human intervention
 let autoRespondEnabled = process.env.MEVORIC_AUTO_RESPOND !== 'false'; // on by default
 const AUTO_RESPOND_DELAY_MS = 8000; // wait 8 seconds before generating a response
-const OLLAMA_URL = process.env.OLLAMA_URL || 'http://192.168.2.169:11434';
-const OLLAMA_MODEL = process.env.OLLAMA_MODEL || 'qwen3:14b';
+const CORTEX_URL = process.env.CORTEX_URL || 'http://localhost:3100';
 let autoRespondDailyLimit = 50; // max auto-responses per day
 
 // Auto-respond tracking
@@ -325,40 +324,31 @@ function getActiveAgents() {
 // it within 8 seconds, Ollama generates a response on their behalf
 // ============================================================
 
-// Queue to prevent multiple Ollama calls from piling up on the GPU
-let ollamaQueue = Promise.resolve();
+// Call Cortex's quick-reply endpoint (uses Claude Haiku on Max plan — fast + free)
+let llmQueue = Promise.resolve();
 
-async function callOllama(userMessage, systemPrompt) {
-  // Chain requests so they run one at a time instead of all at once
+async function callLLM(userMessage, systemPrompt) {
+  // Chain requests so they run one at a time
   const result = new Promise((resolve) => {
-    ollamaQueue = ollamaQueue.then(async () => {
+    llmQueue = llmQueue.then(async () => {
       try {
-        const fullSystem = '/no_think\n' + systemPrompt;
-        console.log(`[Auto-Respond] Calling Ollama (${OLLAMA_MODEL})...`);
+        console.log(`[Auto-Respond] Calling Cortex quick-reply (Haiku)...`);
         const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 45000); // 45 second max
-        const resp = await fetch(`${OLLAMA_URL}/api/chat`, {
+        const timeout = setTimeout(() => controller.abort(), 30000); // 30 second max
+        const resp = await fetch(`${CORTEX_URL}/api/quick-reply`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           signal: controller.signal,
-          body: JSON.stringify({
-            model: OLLAMA_MODEL,
-            messages: [
-              { role: 'system', content: fullSystem },
-              { role: 'user', content: userMessage }
-            ],
-            stream: false,
-            options: { num_predict: 256 }
-          })
+          body: JSON.stringify({ systemPrompt, userMessage })
         });
         clearTimeout(timeout);
         const data = await resp.json();
-        const content = data.message?.content || '';
-        console.log(`[Auto-Respond] Ollama returned ${content.length} chars`);
+        const content = data.reply || '';
+        console.log(`[Auto-Respond] Cortex returned ${content.length} chars`);
         resolve(content || null);
       } catch (err) {
-        const reason = err.name === 'AbortError' ? 'timed out after 45s' : err.message;
-        console.error(`[Auto-Respond] Ollama call failed: ${reason}`);
+        const reason = err.name === 'AbortError' ? 'timed out after 30s' : err.message;
+        console.error(`[Auto-Respond] Cortex call failed: ${reason}`);
         resolve(null);
       }
     });
@@ -442,7 +432,7 @@ ${projectKnowledge ? `\nThings you know about your project:\n${projectKnowledge}
 ${chatHistory ? `\nRecent conversation:\n${chatHistory}` : ''}`;
 
   console.log(`[Auto-Respond] Generating reply from ${agentName} to ${senderName}...`);
-  const response = await callOllama(msg.content, systemPrompt);
+  const response = await callLLM(msg.content, systemPrompt);
 
   if (!response) {
     console.log(`[Auto-Respond] No response generated (Ollama may be unavailable)`);
@@ -1003,8 +993,8 @@ const server = createServer(async (req, res) => {
         ...autoRespondStats,
         enabled: autoRespondEnabled,
         dailyLimit: autoRespondDailyLimit,
-        model: OLLAMA_MODEL,
-        ollamaUrl: OLLAMA_URL
+        model: 'haiku (via Cortex)',
+        cortexUrl: CORTEX_URL
       });
     }
 
