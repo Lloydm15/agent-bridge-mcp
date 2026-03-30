@@ -19,6 +19,19 @@
  *   POST /api/knowledge/:id/share    — Share knowledge to another project
  *   POST /api/knowledge/:id/verify   — Verify or challenge shared knowledge
  *
+ * Tasks (delegation with results):
+ *   POST /api/tasks                  — Create a task for an agent
+ *   GET  /api/tasks?agent=X&status=Y — List tasks (filtered)
+ *   GET  /api/tasks/:id              — Get task status + result
+ *   POST /api/tasks/:id/complete     — Submit task result
+ *   POST /api/tasks/fanout           — Send same task to multiple agents
+ *   GET  /api/tasks/fanout/:id       — Check fan-out status
+ *
+ * Skills (agent capability registry):
+ *   POST /api/skills                 — Register skills for an agent
+ *   GET  /api/skills                 — List all skills (filterable)
+ *   GET  /api/skills/:agent          — Get skills for specific agent
+ *
  * Design references:
  *   - Namespace isolation: Memori (GibsonAI), Apache-2.0 — https://github.com/GibsonAI/memori
  *   - Provenance tracking: Collaborative Memory (arXiv:2505.18279)
@@ -48,8 +61,10 @@ const MESSAGE_LOG_FILE = resolve(__dirname, 'message-log.json');
 // In-memory stores
 // ============================================================
 
-const agents = new Map();   // agentId -> { id, name, baseName, project, cwd, pid, host, startedAt, lastHeartbeat }
+const agents = new Map();   // agentId -> { id, name, baseName, project, cwd, pid, host, startedAt, lastHeartbeat, skills }
 const messages = [];        // [{ id, from, fromName, to, toName, broadcast, content, project, timestamp }]
+const tasks = new Map();    // taskId -> { id, from, fromName, to, toName, project, description, status, result, createdAt, updatedAt, timeout }
+const skills = new Map();   // agentName -> [{ name, description, inputSchema }]
 
 // Knowledge store — per-project namespaces with provenance and verification
 // Design: Memori namespaces (GibsonAI) + Collaborative Memory provenance (arXiv:2505.18279)
@@ -142,6 +157,17 @@ setInterval(() => {
   for (let i = messages.length - 1; i >= 0; i--) {
     if (new Date(messages[i].timestamp).getTime() < cutoff) {
       messages.splice(i, 1);
+    }
+  }
+
+  // Remove completed/failed tasks older than 1 hour, pending tasks older than 10 min
+  for (const [id, task] of tasks) {
+    const age = now - new Date(task.createdAt).getTime();
+    if ((task.status === 'completed' || task.status === 'failed') && age > MSG_TTL_MS) {
+      tasks.delete(id);
+    } else if (task.status === 'pending' && age > 600000) {
+      task.status = 'timeout';
+      task.updatedAt = new Date().toISOString();
     }
   }
 
@@ -547,6 +573,190 @@ const server = createServer(async (req, res) => {
       return json(res, { deleted: true, id });
     }
 
+    // ============================================================
+    // Task Delegation — "do this job and give me the result"
+    // ============================================================
+
+    // POST /api/tasks — Create a task for an agent to execute
+    if (method === 'POST' && path === '/api/tasks') {
+      const body = await readBody(req);
+      const { from, fromName, to, toName, description, project, timeout } = body;
+
+      if (!description) return json(res, { error: 'description is required' }, 400);
+      if (!to && !toName) return json(res, { error: 'to or toName is required' }, 400);
+
+      const id = `task-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const task = {
+        id,
+        from: from || null,
+        fromName: fromName || null,
+        to: to || null,
+        toName: toName || null,
+        project: project || null,
+        description,
+        status: 'pending',      // pending -> in_progress -> completed | failed | timeout
+        result: null,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        timeout: timeout || 300000  // default 5 min
+      };
+      tasks.set(id, task);
+
+      return json(res, { created: true, taskId: id });
+    }
+
+    // GET /api/tasks?agent=X&status=pending — Get tasks assigned to an agent
+    if (method === 'GET' && path === '/api/tasks') {
+      const agentFilter = url.searchParams.get('agent');
+      const statusFilter = url.searchParams.get('status');
+
+      let items = [...tasks.values()];
+      if (agentFilter) {
+        items = items.filter(t => t.to === agentFilter || t.toName === agentFilter);
+      }
+      if (statusFilter) {
+        items = items.filter(t => t.status === statusFilter);
+      }
+      items.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+
+      return json(res, { tasks: items, count: items.length });
+    }
+
+    // GET /api/tasks/:id — Get a single task (check status/result)
+    if (method === 'GET' && path.match(/^\/api\/tasks\/[^/]+$/)) {
+      const id = path.split('/').pop();
+      const task = tasks.get(id);
+      if (!task) return json(res, { error: 'Task not found' }, 404);
+      return json(res, task);
+    }
+
+    // POST /api/tasks/:id/complete — Mark task done with result
+    if (method === 'POST' && path.match(/^\/api\/tasks\/[^/]+\/complete$/)) {
+      const id = path.split('/')[3];
+      const body = await readBody(req);
+      const { result, status } = body;
+
+      const task = tasks.get(id);
+      if (!task) return json(res, { error: 'Task not found' }, 404);
+
+      task.status = status || 'completed';
+      task.result = result || null;
+      task.updatedAt = new Date().toISOString();
+
+      return json(res, { updated: true, taskId: id, status: task.status });
+    }
+
+    // POST /api/tasks/fanout — Send the same task to multiple agents, collect all results
+    if (method === 'POST' && path === '/api/tasks/fanout') {
+      const body = await readBody(req);
+      const { from, fromName, targets, description, project, timeout } = body;
+
+      if (!description) return json(res, { error: 'description is required' }, 400);
+      if (!targets || !Array.isArray(targets) || targets.length === 0) {
+        return json(res, { error: 'targets array is required' }, 400);
+      }
+
+      const fanoutId = `fanout-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const taskIds = [];
+
+      for (const target of targets) {
+        const id = `task-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        const task = {
+          id,
+          fanoutId,
+          from: from || null,
+          fromName: fromName || null,
+          to: target.to || null,
+          toName: target.toName || target || null,
+          project: project || null,
+          description,
+          status: 'pending',
+          result: null,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+          timeout: timeout || 300000
+        };
+        tasks.set(id, task);
+        taskIds.push(id);
+      }
+
+      return json(res, { created: true, fanoutId, taskIds, count: taskIds.length });
+    }
+
+    // GET /api/tasks/fanout/:fanoutId — Check status of all tasks in a fan-out
+    if (method === 'GET' && path.match(/^\/api\/tasks\/fanout\/[^/]+$/)) {
+      const fanoutId = path.split('/').pop();
+      const fanoutTasks = [...tasks.values()].filter(t => t.fanoutId === fanoutId);
+      if (fanoutTasks.length === 0) return json(res, { error: 'Fan-out not found' }, 404);
+
+      const allDone = fanoutTasks.every(t => t.status === 'completed' || t.status === 'failed' || t.status === 'timeout');
+      return json(res, {
+        fanoutId,
+        complete: allDone,
+        tasks: fanoutTasks,
+        summary: {
+          total: fanoutTasks.length,
+          completed: fanoutTasks.filter(t => t.status === 'completed').length,
+          failed: fanoutTasks.filter(t => t.status === 'failed').length,
+          pending: fanoutTasks.filter(t => t.status === 'pending').length,
+          timeout: fanoutTasks.filter(t => t.status === 'timeout').length
+        }
+      });
+    }
+
+    // ============================================================
+    // Skill Packages — agents declare what they can do
+    // ============================================================
+
+    // POST /api/skills — Register skills for an agent
+    if (method === 'POST' && path === '/api/skills') {
+      const body = await readBody(req);
+      const { agent, agentSkills } = body;
+
+      if (!agent) return json(res, { error: 'agent name is required' }, 400);
+      if (!agentSkills || !Array.isArray(agentSkills)) return json(res, { error: 'agentSkills array is required' }, 400);
+
+      skills.set(agent, agentSkills.map(s => ({
+        name: s.name,
+        description: s.description || '',
+        inputSchema: s.inputSchema || null,
+        project: s.project || null,
+        agent
+      })));
+
+      return json(res, { registered: true, agent, count: agentSkills.length });
+    }
+
+    // GET /api/skills — List all registered skills across all agents
+    if (method === 'GET' && path === '/api/skills') {
+      const projectFilter = url.searchParams.get('project');
+      const searchFilter = url.searchParams.get('search')?.toLowerCase();
+
+      let allSkills = [];
+      for (const [agent, agentSkills] of skills) {
+        allSkills.push(...agentSkills);
+      }
+
+      if (projectFilter) {
+        allSkills = allSkills.filter(s => s.project === projectFilter);
+      }
+      if (searchFilter) {
+        allSkills = allSkills.filter(s =>
+          s.name.toLowerCase().includes(searchFilter) ||
+          s.description.toLowerCase().includes(searchFilter)
+        );
+      }
+
+      return json(res, { skills: allSkills, count: allSkills.length });
+    }
+
+    // GET /api/skills/:agent — Get skills for a specific agent
+    if (method === 'GET' && path.match(/^\/api\/skills\/[^/]+$/)) {
+      const agent = decodeURIComponent(path.split('/').pop());
+      const agentSkills = skills.get(agent) || [];
+      return json(res, { agent, skills: agentSkills, count: agentSkills.length });
+    }
+
     // Health check
     if (method === 'GET' && (path === '/' || path === '/health')) {
       return json(res, {
@@ -555,6 +765,8 @@ const server = createServer(async (req, res) => {
         messages: messages.length,
         messageHistory: messageHistory.length,
         knowledge: knowledge.size,
+        tasks: tasks.size,
+        skills: [...skills.values()].reduce((sum, s) => sum + s.length, 0),
         uptime: process.uptime()
       });
     }

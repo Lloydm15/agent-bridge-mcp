@@ -42,8 +42,8 @@ const POLL_MS = (intervalIdx !== -1 && args[intervalIdx + 1])
 
 const DRY_RUN = args.includes('--dry-run');
 
-// Max concurrent Claude calls at once
-const MAX_CONCURRENT = 1;
+// Max concurrent calls at once (bumped for parallel execution)
+const MAX_CONCURRENT = parseInt(process.env.MEVORIC_MAX_CONCURRENT || '3', 10);
 let activeCalls = 0;
 
 // Track which messages we already processed (avoid double-replies)
@@ -323,6 +323,65 @@ async function poll() {
   }
 }
 
+// ── Task execution — agents do jobs and return results ──
+
+async function pollTasks() {
+  const localAgents = getLocalAgents();
+  if (localAgents.length === 0) return;
+
+  for (const agent of localAgents) {
+    if (activeCalls >= MAX_CONCURRENT) break;
+
+    // Fetch pending tasks for this agent
+    const data = await hubFetch(`/api/tasks?agent=${encodeURIComponent(agent.name)}&status=pending`);
+    if (!data || !data.tasks || data.tasks.length === 0) continue;
+
+    for (const task of data.tasks) {
+      if (activeCalls >= MAX_CONCURRENT) break;
+
+      console.log(`[${new Date().toLocaleTimeString()}] [TASK] ${agent.name} executing: ${task.description.slice(0, 80)}`);
+
+      if (DRY_RUN) {
+        console.log(`[DRY RUN] Would execute task ${task.id} as ${agent.name}`);
+        continue;
+      }
+
+      activeCalls++;
+
+      (async () => {
+        try {
+          const reply = await callClaude(
+            agent.name,
+            agent.project || 'unknown',
+            agent.cwd || process.cwd(),
+            task.description,
+            task.fromName || 'system'
+          );
+
+          // Report result back to hub
+          await hubFetch(`/api/tasks/${task.id}/complete`, {
+            method: 'POST',
+            body: JSON.stringify({
+              result: reply || 'No response generated',
+              status: reply ? 'completed' : 'failed'
+            })
+          });
+
+          console.log(`[${new Date().toLocaleTimeString()}] [TASK] ${task.id} ${reply ? 'completed' : 'failed'}`);
+        } catch (err) {
+          console.error(`[Runner] Task error: ${err.message}`);
+          await hubFetch(`/api/tasks/${task.id}/complete`, {
+            method: 'POST',
+            body: JSON.stringify({ result: err.message, status: 'failed' })
+          });
+        } finally {
+          activeCalls--;
+        }
+      })();
+    }
+  }
+}
+
 // ── Proactive conversation — agents ask each other questions ──
 
 const CONVO_INTERVAL_MS = process.env.CONVO_INTERVAL ? parseInt(process.env.CONVO_INTERVAL) * 1000 : 5 * 60 * 1000;
@@ -452,9 +511,11 @@ async function callOllama(systemPrompt, userMessage) {
   }
 }
 
-// Start polling for replies
+// Start polling for messages and tasks
 setInterval(poll, POLL_MS);
+setInterval(pollTasks, POLL_MS);
 poll();
+pollTasks();
 
 // Start proactive conversations — use sequential scheduling to prevent overlap
 console.log(`[Mevoric Runner] Proactive conversations every ${CONVO_INTERVAL_MS / 1000}s`);

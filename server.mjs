@@ -58,6 +58,7 @@ const HEARTBEAT_INTERVAL_MS = parseInt(process.env.MEVORIC_HEARTBEAT_MS || '5000
 const STALE_THRESHOLD_MS = HEARTBEAT_INTERVAL_MS * 3;
 const DEAD_THRESHOLD_MS = parseInt(process.env.MEVORIC_DEAD_MS || '300000', 10);
 const MESSAGE_TTL_MS = parseInt(process.env.MEVORIC_MESSAGE_TTL_MS || '3600000', 10);
+const CONTEXT_TTL_MS = parseInt(process.env.MEVORIC_CONTEXT_TTL_MS || '7200000', 10); // 2 hours
 
 // Hub server (central agent discovery + messaging across machines)
 const HUB_URL = process.env.MEVORIC_HUB_URL || null;
@@ -271,6 +272,41 @@ function cleanOldMessages() {
   }
 }
 
+function cleanStaleContexts() {
+  let files;
+  try {
+    files = readdirSync(CONTEXT_DIR).filter(f => f.endsWith('.json'));
+  } catch {
+    return;
+  }
+
+  // Build set of alive PIDs from agent files
+  const alivePids = new Set();
+  try {
+    const agentFiles = readdirSync(AGENTS_DIR).filter(f => f.endsWith('.json'));
+    for (const f of agentFiles) {
+      try {
+        const a = JSON.parse(readFileSync(resolve(AGENTS_DIR, f), 'utf8'));
+        if (a.pid && isProcessAlive(a.pid)) alivePids.add(String(a.sessionId));
+      } catch {}
+    }
+  } catch {}
+
+  const cutoff = Date.now() - CONTEXT_TTL_MS;
+
+  for (const file of files) {
+    try {
+      const ctx = JSON.parse(readFileSync(resolve(CONTEXT_DIR, file), 'utf8'));
+      const age = new Date(ctx.updatedAt || 0).getTime();
+      // Keep if: context is recent OR its session is still alive
+      if (age >= cutoff) continue;
+      if (ctx.sessionId && alivePids.has(ctx.sessionId)) continue;
+      // Expired and agent is dead — remove
+      unlinkSync(resolve(CONTEXT_DIR, file));
+    } catch {}
+  }
+}
+
 // ============================================================
 // Heartbeat
 // ============================================================
@@ -289,12 +325,18 @@ function syncNameFromDisk() {
   } catch {}
 }
 
+let cleanContextCounter = 0;
 function startHeartbeat() {
   heartbeatTimer = setInterval(() => {
     syncNameFromDisk();
     writeAgentFile();
     hubRegister(); // heartbeat to hub
     cleanOldMessages();
+    // Clean stale contexts every 60 heartbeats (~5 min)
+    if (++cleanContextCounter >= 60) {
+      cleanContextCounter = 0;
+      cleanStaleContexts();
+    }
   }, HEARTBEAT_INTERVAL_MS);
   heartbeatTimer.unref();
 }
@@ -752,7 +794,7 @@ function writeContextFile(name, content, uniqueId) {
   const data = JSON.stringify({
     agentName: name,
     agentId: uniqueId || agentId,
-    baseName: name,
+    baseName: name.split(/[-:]/)[0],
     project: (resolvedProject || process.cwd().split(/[\\/]/).pop()),
     updatedAt: new Date().toISOString(),
     content
@@ -1356,6 +1398,171 @@ function stripSystemTags(text) {
 // Tool Definitions
 // ============================================================
 
+// ============================================================
+// Tool Handlers — Task Delegation, Forking, Skills
+// ============================================================
+
+async function handleDelegateTask(args) {
+  const { to, targets, description, wait = true } = args;
+  if (!description) return { error: 'description is required' };
+
+  const project = resolvedProject || process.cwd().split(/[\\/]/).pop();
+
+  // Fan-out mode
+  if (targets && Array.isArray(targets) && targets.length > 0) {
+    const result = await hubFetchJSON('/api/tasks/fanout', {
+      method: 'POST',
+      body: JSON.stringify({
+        from: agentId,
+        fromName: agentName,
+        targets: targets.map(t => ({ toName: t })),
+        description,
+        project
+      })
+    });
+    if (!result) return { error: 'Hub unreachable — cannot create fan-out task' };
+
+    if (!wait) return { created: true, fanoutId: result.fanoutId, taskIds: result.taskIds };
+
+    // Poll for all results (up to 90s for fan-out)
+    const deadline = Date.now() + 90000;
+    while (Date.now() < deadline) {
+      await new Promise(r => setTimeout(r, 3000));
+      const status = await hubFetchJSON(`/api/tasks/fanout/${result.fanoutId}`);
+      if (status && status.complete) return status;
+    }
+    // Return partial results on timeout
+    const final = await hubFetchJSON(`/api/tasks/fanout/${result.fanoutId}`);
+    return final || { error: 'Timed out waiting for fan-out results' };
+  }
+
+  // Single task mode
+  if (!to) return { error: 'to is required for single task (or use targets for fan-out)' };
+
+  const result = await hubFetchJSON('/api/tasks', {
+    method: 'POST',
+    body: JSON.stringify({
+      from: agentId,
+      fromName: agentName,
+      to: null,
+      toName: to,
+      description,
+      project
+    })
+  });
+  if (!result) return { error: 'Hub unreachable — cannot create task' };
+
+  if (!wait) return { created: true, taskId: result.taskId };
+
+  // Poll for result (up to 60s)
+  const deadline = Date.now() + 60000;
+  while (Date.now() < deadline) {
+    await new Promise(r => setTimeout(r, 3000));
+    const status = await hubFetchJSON(`/api/tasks/${result.taskId}`);
+    if (status && (status.status === 'completed' || status.status === 'failed' || status.status === 'timeout')) {
+      return status;
+    }
+  }
+  return { error: 'Timed out waiting for task result', taskId: result.taskId };
+}
+
+async function handleForkSession(args) {
+  const { fork_name, notes, files_touched, key_decisions } = args;
+  if (!fork_name) return { error: 'fork_name is required' };
+  if (!agentName) return { error: 'Register first before forking' };
+
+  const baseName = resolvedAgentBase || agentName.split(/[-:]/)[0];
+  const forkId = `fork-${fork_name.replace(/[^a-zA-Z0-9_-]/g, '-').toLowerCase()}`;
+
+  // Save a checkpoint with the fork name as the session ID so any new tab can load it
+  const checkpoint = {
+    auto: false,
+    fork: true,
+    forkName: fork_name,
+    forkedFrom: agentName,
+    forkedSessionId: agentSessionId || agentId,
+    task: {
+      description: notes || `Fork: ${fork_name}`,
+      status: 'in_progress'
+    },
+    files_touched: files_touched || [],
+    key_decisions: key_decisions || [],
+    notes: notes || ''
+  };
+
+  const path = writeCheckpointFile(baseName, forkId, checkpoint);
+
+  // Also save a context file for the fork so bootstrap picks it up
+  const safeName = baseName.replace(/[^a-zA-Z0-9_-]/g, '_').toLowerCase();
+  const ctxPath = resolve(CONTEXT_DIR, `${safeName}--${forkId}.json`);
+  const ctxData = JSON.stringify({
+    agentName: `${baseName}:${fork_name}`,
+    baseName,
+    project: resolvedProject || process.cwd().split(/[\\/]/).pop(),
+    updatedAt: new Date().toISOString(),
+    sessionId: forkId,
+    live: false,
+    statusLine: `Fork: ${fork_name}`,
+    content: notes || `Forked from ${agentName}`
+  }, null, 2);
+  try {
+    const tmp = ctxPath + '.tmp';
+    writeFileSync(tmp, ctxData);
+    renameSync(tmp, ctxPath);
+  } catch {}
+
+  return {
+    forked: true,
+    forkName: fork_name,
+    forkId,
+    baseName,
+    checkpointPath: path,
+    note: 'Open a new tab in the same project — it will auto-load this fork via bootstrap.'
+  };
+}
+
+async function handleRegisterSkills(args) {
+  const { skills: agentSkills } = args;
+  if (!agentSkills || !Array.isArray(agentSkills)) return { error: 'skills array is required' };
+  if (!agentName) return { error: 'Register first before declaring skills' };
+
+  const project = resolvedProject || process.cwd().split(/[\\/]/).pop();
+
+  // Register with hub so other agents can discover
+  const result = await hubFetchJSON('/api/skills', {
+    method: 'POST',
+    body: JSON.stringify({
+      agent: agentName,
+      agentSkills: agentSkills.map(s => ({
+        name: s.name,
+        description: s.description,
+        project
+      }))
+    })
+  });
+
+  return result || { registered: true, agent: agentName, count: agentSkills.length, note: 'Hub unreachable — skills registered locally only' };
+}
+
+// Helper for hub API calls (used by task delegation and skills)
+async function hubFetchJSON(path, opts = {}) {
+  if (!HUB_URL) return null;
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 10000);
+    const res = await fetch(`${HUB_URL}${path}`, {
+      ...opts,
+      signal: controller.signal,
+      headers: { 'Content-Type': 'application/json', ...(opts.headers || {}) }
+    });
+    clearTimeout(timer);
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
 const TOOLS = [
   // --- Memory tools ---
   {
@@ -1556,6 +1763,57 @@ const TOOLS = [
       },
       required: ['id', 'verdict']
     }
+  },
+  // --- Task delegation ---
+  {
+    name: 'delegate_task',
+    description: 'Assign a task to another agent and get the result back. The target agent will execute the task via the runner daemon and return a result. You can also fan out the same task to multiple agents at once.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        to: { type: 'string', description: 'Agent name to assign the task to. Use "fanout" to send to multiple agents.' },
+        targets: { type: 'array', items: { type: 'string' }, description: 'For fan-out: array of agent names to send the task to' },
+        description: { type: 'string', description: 'What you want the agent to do' },
+        wait: { type: 'boolean', description: 'Wait for the result (default: true, polls up to 60s)' }
+      },
+      required: ['description']
+    }
+  },
+  {
+    name: 'fork_session',
+    description: 'Create a fork of the current session state as a new checkpoint that another tab can pick up. Saves your current context, task state, and notes into a named fork that any new session with the same agent base name will auto-load.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        fork_name: { type: 'string', description: 'A descriptive name for this fork (e.g., "before-refactor", "experiment-a")' },
+        notes: { type: 'string', description: 'What the forked session should know / continue doing' },
+        files_touched: { type: 'array', items: { type: 'string' }, description: 'Files relevant to the fork' },
+        key_decisions: { type: 'array', items: { type: 'string' }, description: 'Decisions made so far' }
+      },
+      required: ['fork_name']
+    }
+  },
+  {
+    name: 'register_skills',
+    description: 'Declare what this agent can do. Other agents and apps can discover your skills and delegate tasks that match them. Register skills on session start so others know your capabilities.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        skills: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              name: { type: 'string', description: 'Skill name (e.g., "code-review", "financial-analysis")' },
+              description: { type: 'string', description: 'What this skill does' }
+            },
+            required: ['name', 'description']
+          },
+          description: 'Array of skills this agent can perform'
+        }
+      },
+      required: ['skills']
+    }
   }
 ];
 
@@ -1586,6 +1844,10 @@ async function handleToolCall(name, args) {
     case 'query_knowledge': return handleQueryKnowledge(args);
     case 'share_knowledge': return handleShareKnowledge(args);
     case 'verify_knowledge': return handleVerifyKnowledge(args);
+    // Task delegation, forking, skills
+    case 'delegate_task': return handleDelegateTask(args);
+    case 'fork_session': return handleForkSession(args);
+    case 'register_skills': return handleRegisterSkills(args);
     default: return { error: `Unknown tool: ${name}` };
   }
 }
@@ -1791,14 +2053,20 @@ async function runCapturePrompt() {
       const recentPrompts = prompts.slice(-5).map(p => p.prompt.slice(0, 500));
       const liveContent = recentPrompts.join('\n---\n');
 
+      // Generate a short status line from the most recent prompt
+      // This gives other agents a quick summary instead of raw chat dumps
+      const latestPrompt = prompts.length > 0 ? prompts[prompts.length - 1].prompt : '';
+      const statusLine = latestPrompt.slice(0, 200).replace(/\n/g, ' ').trim();
+
       if (liveContent.length > 10) {
         const ctxData = JSON.stringify({
           agentName: name,
-          baseName: name,
+          baseName: name.split(/[-:]/)[0],
           project: (resolvedProject || process.cwd().split(/[\\/]/).pop()),
           updatedAt: new Date().toISOString(),
           sessionId,
           live: true,
+          statusLine: statusLine || null,
           content: liveContent
         }, null, 2);
 
@@ -2178,6 +2446,13 @@ async function runBootstrapContext() {
 
   const myNameLower = myName.toLowerCase();
 
+  // Resolve MY project from cwd so we can filter by it
+  let myProject = null;
+  const cwdFolder = cwd.split(/[\\/]/).pop();
+  if (PROJECT_MAP[cwdFolder]) {
+    myProject = PROJECT_MAP[cwdFolder].project;
+  }
+
   let activeAgents = [];
   try {
     const agentFiles = readdirSync(AGENTS_DIR).filter(f => f.endsWith('.json'));
@@ -2198,26 +2473,48 @@ async function runBootstrapContext() {
     return true;
   });
 
-  // Dedup: keep only the most recent context per agent
+  // Dedup: keep only the most recent context per agent base name
   const ctxByAgent = new Map();
   for (const c of allContexts) {
-    const key = (c.baseName || c.agentName || 'unknown').toLowerCase();
+    const key = (c.baseName || c.agentName || 'unknown').toLowerCase().split(/[-:]/)[0];
     const existing = ctxByAgent.get(key);
     if (!existing || new Date(c.updatedAt || 0) > new Date(existing.updatedAt || 0)) {
       ctxByAgent.set(key, c);
     }
   }
 
-  // Active agents first, then by recency
-  const activeNames = new Set(activeAgents.map(a => (a.baseName || a.name || '').toLowerCase()));
-  const contexts = [...ctxByAgent.values()].sort((a, b) => {
-    const aName = (a.baseName || a.agentName || '').toLowerCase();
-    const bName = (b.baseName || b.agentName || '').toLowerCase();
-    const aAlive = activeNames.has(aName) ? 1 : 0;
-    const bAlive = activeNames.has(bName) ? 1 : 0;
+  // Count sessions per base name (for dedup display)
+  const sessionCountByBase = new Map();
+  for (const c of allContexts) {
+    const key = (c.baseName || c.agentName || 'unknown').toLowerCase().split(/[-:]/)[0];
+    sessionCountByBase.set(key, (sessionCountByBase.get(key) || 0) + 1);
+  }
+
+  // Split into same-project and cross-project
+  const activeNames = new Set(activeAgents.map(a => (a.baseName || a.name || '').toLowerCase().split(/[-:]/)[0]));
+  const allCtx = [...ctxByAgent.values()];
+
+  const sameProject = [];
+  const crossProject = [];
+  for (const ctx of allCtx) {
+    if (myProject && ctx.project === myProject) {
+      sameProject.push(ctx);
+    } else {
+      crossProject.push(ctx);
+    }
+  }
+
+  // Sort each group: active agents first, then by recency
+  const sortCtx = (a, b) => {
+    const aBase = (a.baseName || a.agentName || '').toLowerCase().split(/[-:]/)[0];
+    const bBase = (b.baseName || b.agentName || '').toLowerCase().split(/[-:]/)[0];
+    const aAlive = activeNames.has(aBase) ? 1 : 0;
+    const bAlive = activeNames.has(bBase) ? 1 : 0;
     if (aAlive !== bAlive) return bAlive - aAlive;
     return new Date(b.updatedAt || 0) - new Date(a.updatedAt || 0);
-  });
+  };
+  sameProject.sort(sortCtx);
+  crossProject.sort(sortCtx);
 
   const cursor = readCursor(myName);
   const { messages, newCursor } = readMessagesForAgent(myName, cursor);
@@ -2227,7 +2524,7 @@ async function runBootstrapContext() {
 
   const checkpoint = readLatestCheckpoint(myName, mySessionId);
 
-  if (activeAgents.length === 0 && contexts.length === 0 && messages.length === 0 && !checkpoint) {
+  if (activeAgents.length === 0 && sameProject.length === 0 && crossProject.length === 0 && messages.length === 0 && !checkpoint) {
     process.exit(0);
   }
 
@@ -2253,19 +2550,45 @@ async function runBootstrapContext() {
     parts.push(`ACTIVE AGENTS: ${activeAgents.map(a => `${a.name} (${a.project})`).join(', ')}`);
   }
 
-  for (const ctx of contexts) {
+  // Helper to format a context entry
+  const formatCtx = (ctx, maxContent) => {
     const ageMin = Math.round((Date.now() - new Date(ctx.updatedAt).getTime()) / 1000 / 60);
+    const base = (ctx.baseName || ctx.agentName || '').toLowerCase().split(/[-:]/)[0];
+    const count = sessionCountByBase.get(base) || 1;
+    const countTag = count > 1 ? ` [${count} sessions]` : '';
+
+    // Prefer status line if available, otherwise fall back to content/exchanges
     let summary = '';
-    if (ctx.content) {
-      summary = ctx.content.slice(0, 3000);
+    if (ctx.statusLine) {
+      summary = ctx.statusLine;
+    } else if (ctx.content) {
+      summary = ctx.content.slice(0, maxContent);
     } else if (ctx.exchanges && ctx.exchanges.length > 0) {
-      const recent = ctx.exchanges.slice(-3);
+      const recent = ctx.exchanges.slice(-2);
       summary = recent.map(e =>
-        `User: ${(e.user || '').slice(0, 200)}\nAssistant: ${(e.assistant || '').slice(0, 500)}`
+        `User: ${(e.user || '').slice(0, 150)}\nAssistant: ${(e.assistant || '').slice(0, 300)}`
       ).join('\n---\n');
     }
-    if (summary) {
-      parts.push(`--- CONTEXT FROM ${ctx.agentName} (${ctx.project || 'unknown'}, updated ${ageMin}min ago) ---\n${summary}`);
+    if (!summary) return null;
+    return `--- CONTEXT FROM ${ctx.agentName} (${ctx.project || 'unknown'}${countTag}, updated ${ageMin}min ago) ---\n${summary}`;
+  };
+
+  // Same-project contexts get full detail
+  for (const ctx of sameProject) {
+    const line = formatCtx(ctx, 3000);
+    if (line) parts.push(line);
+  }
+
+  // Cross-project: only show active agents, with shorter content
+  const activeCross = crossProject.filter(ctx => {
+    const base = (ctx.baseName || ctx.agentName || '').toLowerCase().split(/[-:]/)[0];
+    return activeNames.has(base);
+  });
+  if (activeCross.length > 0) {
+    parts.push('--- OTHER PROJECTS (active only) ---');
+    for (const ctx of activeCross) {
+      const line = formatCtx(ctx, 500);
+      if (line) parts.push(line);
     }
   }
 
