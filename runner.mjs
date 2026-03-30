@@ -184,6 +184,19 @@ async function callClaude(agentName, project, cwd, messageContent, senderName) {
     `6. If they're just being polite (thanks, welcome, etc), say "Got it." and nothing else.`
   ].join(' ');
 
+  const fullPrompt = `${systemPrompt}\n\nMessage from ${senderName}: "${messageContent}"${knowledgeContext}\n\nReply to them:`;
+
+  // Smart routing: complex stuff goes to Claude (via Cortex), simple stuff to Ollama
+  if (shouldUseClaude(messageContent)) {
+    console.log(`[Router] Using Claude (via Cortex) — message is complex`);
+    const claudeReply = await callCortexChat(fullPrompt);
+    if (claudeReply) return claudeReply;
+    // Fall back to Ollama if Cortex fails
+    console.log(`[Router] Cortex failed, falling back to Ollama`);
+  } else {
+    console.log(`[Router] Using Ollama — message is simple`);
+  }
+
   return callOllama(systemPrompt, `Message from ${senderName}: "${messageContent}"${knowledgeContext}\n\nReply to them:`);
 }
 
@@ -477,6 +490,61 @@ async function startConversation() {
   } finally {
     activeCalls--;
   }
+}
+
+// ── Cortex Chat (Claude via flat-rate Cortex API) ──────
+
+async function callCortexChat(prompt) {
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 120000);
+
+    const res = await fetch(`${CORTEX_URL}/api/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: prompt, conversation_id: null }),
+      signal: controller.signal
+    });
+
+    clearTimeout(timer);
+    if (!res.ok) return null;
+
+    // Parse SSE stream — collect all text chunks
+    const text = await res.text();
+    let result = '';
+    for (const line of text.split('\n')) {
+      if (!line.startsWith('data: ')) continue;
+      const payload = line.slice(6).trim();
+      if (payload === '[DONE]') break;
+      try {
+        const parsed = JSON.parse(payload);
+        if (parsed.text) result += parsed.text;
+        if (parsed.content) result += parsed.content;
+        if (parsed.delta) result += parsed.delta;
+      } catch {
+        // Not JSON — might be raw text chunk
+        if (payload && payload !== '[DONE]') result += payload;
+      }
+    }
+
+    return result.trim() || null;
+  } catch (err) {
+    console.error(`[CortexChat] Error: ${err.message}`);
+    return null;
+  }
+}
+
+// ── Smart routing — decide Ollama vs Claude ────────────
+
+const COMPLEX_WORDS = /\b(analyze|analyse|compare|explain|build|design|review|debug|refactor|implement|architecture|strategy|evaluate|optimize|plan|migrate|integrate)\b/i;
+
+function shouldUseClaude(messageContent) {
+  if (!messageContent) return false;
+  // Long messages → Claude
+  if (messageContent.length > 200) return true;
+  // Complex keywords → Claude
+  if (COMPLEX_WORDS.test(messageContent)) return true;
+  return false;
 }
 
 // Generic Ollama call (used by both reply and convo)
