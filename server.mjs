@@ -98,6 +98,48 @@ const PROJECT_MAP = {
   'lloyd':          { project: 'Abyss',           agent: 'abyss' },
 };
 
+// Skills each project agent auto-registers on startup
+const PROJECT_SKILLS = {
+  'Cortex': [
+    { name: 'knowledge-search', description: 'Search personal knowledge base (12K+ entries across 5 domains)' },
+    { name: 'knowledge-store', description: 'Store new knowledge, facts, preferences, or notes' },
+    { name: 'memory-retrieval', description: 'RAG-powered memory recall with vector + full-text search' },
+    { name: 'file-browser', description: 'Browse and manage files stored in the knowledge system' },
+    { name: 'web-scraping', description: 'Scrape websites and extract content for knowledge storage' },
+    { name: 'brain-visualization', description: '3D brain visualization of knowledge connections' },
+    { name: 'conversation', description: 'Chat with memory-aware AI that remembers everything about Lloyd' },
+  ],
+  'Clonebot': [
+    { name: 'voice-chatbot', description: 'Create and manage voice chatbots (Delphi.ai clone)' },
+    { name: 'transcript-processing', description: 'Process and index podcast/video transcripts' },
+    { name: 'content-sync', description: 'Sync content from YouTube channels and other sources' },
+    { name: 'llm-routing', description: 'Route LLM requests through LiteLLM with model selection' },
+  ],
+  'Emergence': [
+    { name: 'agent-simulation', description: 'Run multi-agent simulations where agents learn by doing' },
+    { name: '3d-world', description: 'Manage 3D simulation world and agent environments' },
+    { name: 'agent-behavior', description: 'Design and modify agent behaviors and learning rules' },
+  ],
+  'NovaStreamLive': [
+    { name: 'podcast-management', description: 'Manage podcasts, episodes, and CRM data' },
+    { name: 'video-editing', description: 'Video processing and editing workflows' },
+    { name: 'crm', description: 'Customer relationship management for podcast clients' },
+  ],
+  'WeFixPodcasts': [
+    { name: 'marketing-site', description: 'WeFixPodcasts marketing website management' },
+    { name: 'seo', description: 'SEO optimization for WeFixPodcasts.com' },
+  ],
+  'Mevoric': [
+    { name: 'agent-bridge', description: 'Manage inter-agent communication and shared memory' },
+    { name: 'knowledge-sharing', description: 'Share knowledge items between projects' },
+    { name: 'task-delegation', description: 'Coordinate task delegation between agents' },
+  ],
+  'Abyss': [
+    { name: 'general-assistant', description: 'General purpose tasks, research, file management on Windows PC' },
+    { name: 'system-admin', description: 'Windows PC administration, process management, troubleshooting' },
+  ],
+};
+
 function resolveProjectInfo() {
   const folderName = process.cwd().split(/[\\/]/).pop();
   return PROJECT_MAP[folderName] || null;
@@ -2605,7 +2647,7 @@ async function runBootstrapContext() {
   const output = {
     hookSpecificOutput: {
       hookEventName: data.hook_event_name || 'SessionStart',
-      additionalContext: `--- MEVORIC BOOTSTRAP ---\nYou are "${myName}". Mevoric connects you with other Claude Code sessions and provides persistent memory. Messages from other agents are delivered automatically before each prompt.\n\n${parts.join('\n\n')}\n--- END BOOTSTRAP ---`
+      additionalContext: `--- MEVORIC BOOTSTRAP ---\nYou are "${myName}". Mevoric connects you with other Claude Code sessions and provides persistent memory. Messages from other agents are delivered automatically before each prompt.\n\nIf another active agent is better suited for part of a task, use delegate_task to hand it off instead of doing everything yourself. Use register_skills to announce what you can do if you haven't already.\n\n${parts.join('\n\n')}\n--- END BOOTSTRAP ---`
     }
   };
 
@@ -2658,6 +2700,21 @@ if (process.argv.includes('--capture-prompt')) {
     try { writeFileSync(resolve(tmpdir(), `mevoric-agent-ppid-${process.ppid}`), agentId); } catch {}
     hubRegister();
     startHeartbeat();
+
+    // Auto-register skills for this project so other agents can discover what we do
+    const myProject = resolvedProject || process.cwd().split(/[\\/]/).pop();
+    const mySkills = PROJECT_SKILLS[myProject];
+    if (mySkills && agentName && HUB_URL) {
+      hubFetchJSON('/api/skills', {
+        method: 'POST',
+        body: JSON.stringify({
+          agent: agentName,
+          agentSkills: mySkills.map(s => ({ name: s.name, description: s.description, project: myProject }))
+        })
+      }).then(r => {
+        if (r) console.error(`[Mevoric] Auto-registered ${mySkills.length} skills for ${agentName}`);
+      }).catch(() => {});
+    }
 
     const cleanup = () => {
       if (heartbeatTimer) clearInterval(heartbeatTimer);
