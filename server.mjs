@@ -2237,9 +2237,8 @@ async function runCapturePrompt() {
         const searchQuery = terms.join(' ');
         const resp = await hubFetch('GET', `/api/knowledge?search=${encodeURIComponent(searchQuery)}`, null, 2000);
         if (resp?.knowledge) {
-          // Only show results from OTHER projects
+          // Show results from any project (including our own — other tabs need this)
           const fromOthers = resp.knowledge
-            .filter(k => k.project !== myProject)
             .slice(0, 3);
 
           if (fromOthers.length > 0) {
@@ -2560,14 +2559,20 @@ async function runCheckMessages() {
     return true;
   });
 
-  // Also check hub for new alerts
+  // Also check hub for new alerts and recent corrections
   let hubAlerts = [];
+  let hubCorrections = [];
   try {
-    const alertsResp = await hubFetch('GET', '/api/alerts?active=true', null, 2000);
+    const since1h = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+    const [alertsResp, correctionsResp] = await Promise.all([
+      hubFetch('GET', '/api/alerts?active=true', null, 2000),
+      hubFetch('GET', `/api/corrections?since=${since1h}`, null, 2000)
+    ]);
     if (alertsResp?.alerts) hubAlerts = alertsResp.alerts;
+    if (correctionsResp?.corrections) hubCorrections = correctionsResp.corrections;
   } catch {}
 
-  if (directMessages.length === 0 && hubAlerts.length === 0) {
+  if (directMessages.length === 0 && hubAlerts.length === 0 && hubCorrections.length === 0) {
     process.exit(0);
   }
 
@@ -2580,6 +2585,14 @@ async function runCheckMessages() {
       return `[${(a.severity || 'warning').toUpperCase()}] ${a.content} (${ageMin}min ago)`;
     });
     contextParts.push(`--- ACTIVE ALERTS ---\n${alertLines.join('\n')}\n--- END ALERTS ---`);
+  }
+
+  // Recent corrections (from any project, including your own)
+  if (hubCorrections.length > 0) {
+    const corrLines = hubCorrections.slice(0, 5).map(c =>
+      `- [${c.project || 'unknown'}]: ${c.content}`
+    );
+    contextParts.push(`--- RECENT CORRECTIONS ---\n${corrLines.join('\n')}\nFollow these rules.\n--- END CORRECTIONS ---`);
   }
 
   // Messages
@@ -2745,9 +2758,8 @@ async function runBootstrapContext() {
   // Recent corrections from any project
   if (hubCorrections.length > 0) {
     // Only show corrections from OTHER projects (current project's are already in memory)
-    const otherCorrections = hubCorrections.filter(c => c.project !== myProject);
-    if (otherCorrections.length > 0) {
-      const corrLines = otherCorrections.slice(0, 5).map(c => {
+    if (hubCorrections.length > 0) {
+      const corrLines = hubCorrections.slice(0, 5).map(c => {
         return `- [${c.project || 'unknown'}]: ${c.content}`;
       });
       parts.push(`--- CORRECTIONS FROM OTHER PROJECTS (${otherCorrections.length}) ---\n${corrLines.join('\n')}\nApply these rules to your work too.\n--- END CORRECTIONS ---`);
