@@ -2033,22 +2033,19 @@ async function runCapturePrompt() {
   const entry = JSON.stringify({ ts: Date.now(), prompt: clean });
   appendFileSync(promptFilePath, entry + '\n', 'utf8');
 
-  // --- First-prompt naming: rename agent from "abyss-3" to "abyss:fix-blurry-wan" ---
+  // --- First-prompt naming: rename agent ONCE from "abyss" to "abyss:fix-blurry-wan" ---
+  // Only rename if the agent doesn't already have a descriptive name (contains ':')
   if (isFirstPrompt && clean.length >= 5) {
     try {
       ensureDirs();
       const baseName = resolvedAgentBase || process.env.MEVORIC_AGENT_NAME || process.env.AGENT_BRIDGE_NAME;
       if (baseName) {
-        const slug = generateSlug(clean);
-        const descriptiveName = `${baseName}:${slug}`;
-
         // Find our agent file via breadcrumb (preferred) or ppid fallback
         const cwd = process.cwd();
         let foundAgentId = null;
         try {
           foundAgentId = readFileSync(resolve(tmp, `mevoric-agent-ppid-${process.ppid}`), 'utf8').trim();
         } catch {}
-        // Fallback: scan agent files for matching ppid
         if (!foundAgentId) {
           const files = readdirSync(AGENTS_DIR).filter(f => f.endsWith('.json'));
           for (const file of files) {
@@ -2056,7 +2053,20 @@ async function runCapturePrompt() {
             if (ad && ad.ppid === process.ppid) { foundAgentId = ad.id; break; }
           }
         }
+
+        // Check if agent already has a descriptive name — skip rename if so
+        let alreadyNamed = false;
         if (foundAgentId) {
+          const agentPath = resolve(AGENTS_DIR, `${foundAgentId}.json`);
+          const agentData = readAgentFile(agentPath);
+          if (agentData && agentData.name && agentData.name.includes(':')) {
+            alreadyNamed = true;
+          }
+        }
+
+        if (!alreadyNamed && foundAgentId) {
+          const slug = generateSlug(clean);
+          const descriptiveName = `${baseName}:${slug}`;
           const agentPath = resolve(AGENTS_DIR, `${foundAgentId}.json`);
           const agentData = readAgentFile(agentPath);
           if (agentData) {
@@ -2066,7 +2076,6 @@ async function runCapturePrompt() {
             writeFileSync(tmpAgent, JSON.stringify(agentData, null, 2));
             renameSync(tmpAgent, agentPath);
           }
-        }
 
         // Re-register with hub under the new descriptive name
         // Use session-based ID so each tab gets its own slot on the hub
@@ -2091,6 +2100,7 @@ async function runCapturePrompt() {
             signal: controller.signal
           }).catch(() => {});
           clearTimeout(timer);
+        }
         }
       }
     } catch {} // Best-effort — naming is cosmetic, don't block
@@ -2934,16 +2944,8 @@ if (process.argv.includes('--capture-prompt')) {
       }
     } catch {}
 
-    // Only deduplicate if we still have a generic name (no colon = no descriptive slug yet)
-    if (agentName && !agentName.includes(':')) {
-      const existing = getAllAgents().filter(a => a.status === 'active' && a.name?.toLowerCase() === agentName.toLowerCase());
-      if (existing.length > 0) {
-        const allNames = getAllAgents().map(a => a.name?.toLowerCase()).filter(Boolean);
-        let suffix = 2;
-        while (allNames.includes(`${agentName.toLowerCase()}-${suffix}`)) suffix++;
-        agentName = `${agentBaseName}-${suffix}`;
-      }
-    }
+    // No more number suffixes — agents keep their base name.
+    // Each tab gets a unique identity through session-based hub registration instead.
 
     writeAgentFile();
     // Write breadcrumb so hooks can find our agentId via shared parent PID
