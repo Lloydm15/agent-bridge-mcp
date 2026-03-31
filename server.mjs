@@ -636,8 +636,24 @@ async function handleSendMessage(args) {
   if (!to) return { error: 'Target agent (to) is required' };
   if (!content) return { error: 'Message content is required' };
 
-  const target = resolveAgent(to);
-  if (!target) {
+  // Try local agents first, then query hub for same-project tabs
+  let target = resolveAgent(to);
+  let hubTarget = null;
+
+  if (!target && HUB_URL) {
+    // Query hub for agents matching the name (covers same-project tabs)
+    const hubAgents = await hubFetch('GET', '/api/agents', null, 3000);
+    if (hubAgents?.agents) {
+      const nameL = to.toLowerCase();
+      hubTarget = hubAgents.agents.find(a =>
+        a.name?.toLowerCase() === nameL ||
+        a.name?.toLowerCase().includes(nameL) ||
+        a.id === to
+      );
+    }
+  }
+
+  if (!target && !hubTarget) {
     const agents = getAllAgents().filter(a => !a.isMe && a.status === 'active');
     return {
       error: `No active agent found matching "${to}"`,
@@ -645,12 +661,15 @@ async function handleSendMessage(args) {
     };
   }
 
-  const msg = writeMessage(target.id, target.name, content, false);
-  // Also send via hub for cross-machine delivery
+  const targetId = target?.id || hubTarget?.id;
+  const targetName = target?.name || hubTarget?.name;
+
+  if (target) writeMessage(targetId, targetName, content, false);
+  // Always send via hub so same-project tabs and cross-machine agents get it
   const project = resolvedProject || process.cwd().split(/[\\/]/).pop();
   hubFetch('POST', '/api/messages', {
     from: agentId, fromName: agentName,
-    to: target.id, toName: target.name,
+    to: targetId, toName: targetName,
     content, project
   }).catch(() => {});
 
@@ -666,7 +685,7 @@ async function handleSendMessage(args) {
     // Check local messages for a reply from the target
     const localNew = readNewMessages(false);
     const fromTarget = localNew.find(m =>
-      (m.from === target.id || m.fromName === target.name) && !m.broadcast
+      (m.from === targetId || m.fromName === targetName) && !m.broadcast
     );
     if (fromTarget) { reply = fromTarget; break; }
 
@@ -676,7 +695,7 @@ async function handleSendMessage(args) {
     );
     if (hubResult && hubResult.messages) {
       const fromTargetHub = hubResult.messages.find(m =>
-        (m.from === target.id || m.fromName === target.name) && !m.broadcast
+        (m.from === targetId || m.fromName === targetName) && !m.broadcast
       );
       if (fromTargetHub) {
         lastHubReadTimestamp = Date.now();
@@ -688,9 +707,8 @@ async function handleSendMessage(args) {
 
   const result = {
     sent: true,
-    messageId: msg.id,
-    to: { id: target.id, name: target.name },
-    timestamp: msg.timestamp
+    to: { id: targetId, name: targetName },
+    timestamp: new Date().toISOString()
   };
 
   if (reply) {
@@ -2051,6 +2069,7 @@ async function runCapturePrompt() {
         }
 
         // Re-register with hub under the new descriptive name
+        // Use session-based ID so each tab gets its own slot on the hub
         if (HUB_URL) {
           const controller = new AbortController();
           const timer = setTimeout(() => controller.abort(), 3000);
@@ -2058,7 +2077,7 @@ async function runCapturePrompt() {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
-              id: foundAgentId || `capture-${sessionId.slice(0, 8)}`,
+              id: `session-${sessionId.slice(0, 8)}`,
               name: descriptiveName,
               baseName,
               project: (resolvedProject || process.cwd().split(/[\\/]/).pop()),
@@ -2539,6 +2558,7 @@ async function runCheckMessages() {
   try { data = JSON.parse(raw); } catch { process.exit(0); }
 
   const cwd = data.cwd || process.cwd();
+  const sessionId = data.session_id || '';
   const name = resolveAgentName(cwd);
   if (!name) process.exit(0);
 
@@ -2549,11 +2569,20 @@ async function runCheckMessages() {
     writeCursor(name, newCursor);
   }
 
+  // Also check hub for messages addressed to this session specifically
+  let hubMessages = [];
+  if (sessionId && HUB_URL) {
+    try {
+      const sessionAgentId = `session-${sessionId.slice(0, 8)}`;
+      const resp = await hubFetch('GET', `/api/messages/${sessionAgentId}?name=${encodeURIComponent(name)}`, null, 2000);
+      if (resp?.messages) hubMessages = resp.messages;
+    } catch {}
+  }
+
   // Filter out session summaries — they're just noise in the prompt.
-  // Session-end broadcasts contain "finished:" and are from the ingest hook.
-  const directMessages = messages.filter(m => {
+  const allMessages = [...messages, ...hubMessages];
+  const directMessages = allMessages.filter(m => {
     const content = m.content || '';
-    const from = m.fromName || m.from || '';
     // Skip session summaries like "abyss-3 finished: ..."
     if (content.match(/^[\w-]+ finished:/)) return false;
     return true;
