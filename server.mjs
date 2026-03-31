@@ -2313,20 +2313,22 @@ async function runIngest() {
 
   // --- 0. Detect corrections in user prompts and sync to hub ---
   try {
+    // Only match direct imperative corrections, not questions or general conversation
     const correctionPatterns = [
-      /\bdon'?t\b.*\b(do|use|add|create|make|build|put|write|include|suggest|run)\b/i,
-      /\bnever\b.*\b(do|use|add|create|make|build|put|write|include|suggest|run|guess)\b/i,
-      /\bstop\b.*\b(doing|using|adding|creating|making|suggesting)\b/i,
-      /\balways\b.*\b(do|use|check|read|ask|test|verify)\b/i,
-      /\bthat'?s\s+(wrong|incorrect|not right|not what)/i,
+      /^don'?t\b.*\b(do|use|add|create|make|build|put|write|include|suggest|run)\b/i,
+      /^never\b.*\b(do|use|add|create|make|build|put|write|include|suggest|run|guess)\b/i,
+      /^stop\b\s+(doing|using|adding|creating|making|suggesting)\b/i,
+      /^always\b\s+(do|use|check|read|ask|test|verify)\b/i,
+      /\bthat'?s\s+(wrong|incorrect|not right|not what I)/i,
       /\bi\s+told\s+you\s+(not\s+to|to\s+always|to\s+never)/i,
-      /\bno\s+not\s+that\b/i,
-      /\bwrong\s+(file|port|path|server|machine|project|database)\b/i
+      /^no,?\s+not\s+that\b/i,
+      /^wrong\s+(file|port|path|server|machine|project|database)\b/i
     ];
 
     for (const entry of allPrompts) {
-      const text = entry.prompt;
-      if (text.length < 15 || text.length > 500) continue; // Skip very short or very long prompts
+      const text = entry.prompt.trim();
+      if (text.length < 15 || text.length > 300) continue; // Skip very short or very long
+      if (text.endsWith('?')) continue; // Questions are not corrections
       const isCorrection = correctionPatterns.some(p => p.test(text));
       if (isCorrection) {
         await hubFetch('POST', '/api/corrections', {

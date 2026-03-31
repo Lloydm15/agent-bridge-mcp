@@ -1219,6 +1219,16 @@ const server = createServer(async (req, res) => {
       return json(res, { corrections: items, count: items.length });
     }
 
+    // DELETE /api/corrections/:id
+    if (method === 'DELETE' && path.match(/^\/api\/corrections\/[^/]+$/)) {
+      const id = path.split('/').pop();
+      if (!corrections.has(id)) return json(res, { error: 'Correction not found' }, 404);
+      corrections.delete(id);
+      markCorrectionsDirty();
+      saveCorrections();
+      return json(res, { deleted: true, id });
+    }
+
     // ============================================================
     // Activity Summary — cross-project daily catch-up
     // ============================================================
