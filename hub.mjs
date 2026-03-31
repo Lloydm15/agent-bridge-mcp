@@ -77,6 +77,8 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const KNOWLEDGE_FILE = resolve(__dirname, 'knowledge.json');
 const MESSAGE_LOG_FILE = resolve(__dirname, 'message-log.json');
 const AUTO_RESPOND_STATS_FILE = resolve(__dirname, 'auto-respond-stats.json');
+const ALERTS_FILE = resolve(__dirname, 'alerts.json');
+const CORRECTIONS_FILE = resolve(__dirname, 'corrections.json');
 
 // Load persisted stats on startup
 try {
@@ -147,6 +149,12 @@ const knowledge = new Map(); // knowledgeId -> { id, content, project, createdBy
 // Message history — permanent log of all messages (survives delivery/expiry)
 let messageHistory = [];
 
+// Alerts — cross-project notifications (server down, port changed, etc.)
+const alerts = new Map(); // alertId -> { id, content, severity, project, agent, affectsProjects, timestamp, resolved, resolvedAt, resolvedBy }
+
+// Corrections — user feedback that applies across all projects
+const corrections = new Map(); // correctionId -> { id, content, project, agent, timestamp }
+
 // ============================================================
 // Knowledge Persistence — survives hub restarts
 // ============================================================
@@ -213,6 +221,56 @@ function logMessage(msg) {
 loadMessageHistory();
 
 // ============================================================
+// Alerts Persistence
+// ============================================================
+
+function loadAlerts() {
+  try {
+    const data = JSON.parse(readFileSync(ALERTS_FILE, 'utf8'));
+    for (const item of data) alerts.set(item.id, item);
+    console.log(`[Mevoric Hub] Loaded ${alerts.size} alerts from disk`);
+  } catch { /* first run */ }
+}
+
+function saveAlerts() {
+  try {
+    writeFileSync(ALERTS_FILE, JSON.stringify([...alerts.values()], null, 2));
+  } catch (err) {
+    console.error(`[Mevoric Hub] Failed to save alerts: ${err.message}`);
+  }
+}
+
+let alertsDirty = false;
+function markAlertsDirty() { alertsDirty = true; }
+
+loadAlerts();
+
+// ============================================================
+// Corrections Persistence
+// ============================================================
+
+function loadCorrections() {
+  try {
+    const data = JSON.parse(readFileSync(CORRECTIONS_FILE, 'utf8'));
+    for (const item of data) corrections.set(item.id, item);
+    console.log(`[Mevoric Hub] Loaded ${corrections.size} corrections from disk`);
+  } catch { /* first run */ }
+}
+
+function saveCorrections() {
+  try {
+    writeFileSync(CORRECTIONS_FILE, JSON.stringify([...corrections.values()], null, 2));
+  } catch (err) {
+    console.error(`[Mevoric Hub] Failed to save corrections: ${err.message}`);
+  }
+}
+
+let correctionsDirty = false;
+function markCorrectionsDirty() { correctionsDirty = true; }
+
+loadCorrections();
+
+// ============================================================
 // Cleanup timer — remove dead agents and expired messages
 // ============================================================
 
@@ -259,6 +317,35 @@ setInterval(() => {
     saveKnowledge();
     knowledgeDirty = false;
   }
+
+  // Auto-resolve alerts older than 4 hours, remove resolved alerts older than 24 hours
+  const alertAutoResolve = 4 * 60 * 60 * 1000;
+  const alertExpiry = 24 * 60 * 60 * 1000;
+  for (const [id, alert] of alerts) {
+    const age = now - new Date(alert.timestamp).getTime();
+    if (alert.resolved && age > alertExpiry) {
+      alerts.delete(id);
+      markAlertsDirty();
+    } else if (!alert.resolved && age > alertAutoResolve) {
+      alert.resolved = true;
+      alert.resolvedAt = new Date().toISOString();
+      alert.resolvedBy = 'auto-expire';
+      markAlertsDirty();
+    }
+  }
+
+  // Remove corrections older than 90 days
+  const correctionExpiry = 90 * 24 * 60 * 60 * 1000;
+  for (const [id, c] of corrections) {
+    if (now - new Date(c.timestamp).getTime() > correctionExpiry) {
+      corrections.delete(id);
+      markCorrectionsDirty();
+    }
+  }
+
+  // Persist alerts/corrections if changed
+  if (alertsDirty) { saveAlerts(); alertsDirty = false; }
+  if (correctionsDirty) { saveCorrections(); correctionsDirty = false; }
 }, 30000);
 
 // ============================================================
@@ -1032,6 +1119,144 @@ const server = createServer(async (req, res) => {
       return json(res, { reset: true });
     }
 
+    // ============================================================
+    // Alerts — cross-project notifications
+    // ============================================================
+
+    // POST /api/alerts — Create an alert
+    if (method === 'POST' && path === '/api/alerts' && !path.includes('/resolve')) {
+      const body = await readBody(req);
+      const { content, severity, project, agent, affectsProjects } = body;
+      if (!content) return json(res, { error: 'content is required' }, 400);
+
+      // Deduplicate: skip if a similar active alert exists from same project in last 30 min
+      const thirtyMinAgo = Date.now() - 30 * 60 * 1000;
+      for (const existing of alerts.values()) {
+        if (!existing.resolved && existing.project === project &&
+            new Date(existing.timestamp).getTime() > thirtyMinAgo &&
+            existing.content.toLowerCase().includes(content.toLowerCase().slice(0, 50))) {
+          return json(res, { stored: true, id: existing.id, deduplicated: true });
+        }
+      }
+
+      const id = `alert-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const alert = {
+        id, content,
+        severity: severity || 'warning',
+        project: project || null,
+        agent: agent || null,
+        affectsProjects: affectsProjects || 'all',
+        timestamp: new Date().toISOString(),
+        resolved: false, resolvedAt: null, resolvedBy: null
+      };
+      alerts.set(id, alert);
+      markAlertsDirty();
+      saveAlerts();
+      return json(res, { stored: true, id });
+    }
+
+    // GET /api/alerts?since=ISO&active=true
+    if (method === 'GET' && path === '/api/alerts') {
+      const since = url.searchParams.get('since');
+      const activeOnly = url.searchParams.get('active') === 'true';
+      const sinceTime = since ? new Date(since).getTime() : 0;
+
+      let items = [...alerts.values()];
+      if (sinceTime) items = items.filter(a => new Date(a.timestamp).getTime() > sinceTime);
+      if (activeOnly) items = items.filter(a => !a.resolved);
+      items.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+
+      return json(res, { alerts: items, count: items.length });
+    }
+
+    // POST /api/alerts/:id/resolve
+    if (method === 'POST' && path.match(/^\/api\/alerts\/[^/]+\/resolve$/)) {
+      const id = path.split('/')[3];
+      const body = await readBody(req);
+      const alert = alerts.get(id);
+      if (!alert) return json(res, { error: 'Alert not found' }, 404);
+      alert.resolved = true;
+      alert.resolvedAt = new Date().toISOString();
+      alert.resolvedBy = body.agent || 'manual';
+      markAlertsDirty();
+      saveAlerts();
+      return json(res, { resolved: true, id });
+    }
+
+    // ============================================================
+    // Corrections — cross-project user feedback
+    // ============================================================
+
+    // POST /api/corrections
+    if (method === 'POST' && path === '/api/corrections') {
+      const body = await readBody(req);
+      const { content, project, agent, source } = body;
+      if (!content) return json(res, { error: 'content is required' }, 400);
+
+      const id = `corr-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const correction = {
+        id, content,
+        project: project || null,
+        agent: agent || null,
+        source: source || 'auto-detect',
+        timestamp: new Date().toISOString()
+      };
+      corrections.set(id, correction);
+      markCorrectionsDirty();
+      saveCorrections();
+      return json(res, { stored: true, id });
+    }
+
+    // GET /api/corrections?since=ISO
+    if (method === 'GET' && path === '/api/corrections') {
+      const since = url.searchParams.get('since');
+      const sinceTime = since ? new Date(since).getTime() : 0;
+
+      let items = [...corrections.values()];
+      if (sinceTime) items = items.filter(c => new Date(c.timestamp).getTime() > sinceTime);
+      items.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+
+      return json(res, { corrections: items, count: items.length });
+    }
+
+    // ============================================================
+    // Activity Summary — cross-project daily catch-up
+    // ============================================================
+
+    // GET /api/activity?since=ISO&limit=N
+    if (method === 'GET' && path === '/api/activity') {
+      const since = url.searchParams.get('since');
+      const limit = parseInt(url.searchParams.get('limit') || '10', 10);
+      const sinceTime = since ? new Date(since).getTime() : Date.now() - 24 * 60 * 60 * 1000;
+
+      const recentMessages = messageHistory
+        .filter(m => new Date(m.timestamp).getTime() > sinceTime)
+        .slice(-limit);
+
+      const recentKnowledge = [...knowledge.values()]
+        .filter(k => new Date(k.timestamp).getTime() > sinceTime)
+        .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp))
+        .slice(0, limit);
+
+      const recentTasks = [...tasks.values()]
+        .filter(t => new Date(t.createdAt).getTime() > sinceTime)
+        .slice(0, limit);
+
+      const activeAlerts = [...alerts.values()].filter(a => !a.resolved);
+      const recentCorrections = [...corrections.values()]
+        .filter(c => new Date(c.timestamp).getTime() > sinceTime);
+
+      return json(res, {
+        agents: getActiveAgents(),
+        recentMessages,
+        recentKnowledge,
+        recentTasks,
+        activeAlerts,
+        recentCorrections,
+        period: { since: new Date(sinceTime).toISOString(), until: new Date().toISOString() }
+      });
+    }
+
     // Health check
     if (method === 'GET' && (path === '/' || path === '/health')) {
       return json(res, {
@@ -1040,6 +1265,8 @@ const server = createServer(async (req, res) => {
         messages: messages.length,
         messageHistory: messageHistory.length,
         knowledge: knowledge.size,
+        alerts: [...alerts.values()].filter(a => !a.resolved).length,
+        corrections: corrections.size,
         tasks: tasks.size,
         skills: [...skills.values()].reduce((sum, s) => sum + s.length, 0),
         uptime: process.uptime(),

@@ -61,7 +61,7 @@ const MESSAGE_TTL_MS = parseInt(process.env.MEVORIC_MESSAGE_TTL_MS || '3600000',
 const CONTEXT_TTL_MS = parseInt(process.env.MEVORIC_CONTEXT_TTL_MS || '7200000', 10); // 2 hours
 
 // Hub server (central agent discovery + messaging across machines)
-const HUB_URL = process.env.MEVORIC_HUB_URL || null;
+const HUB_URL = process.env.MEVORIC_HUB_URL || process.env.AGENT_BRIDGE_HUB_URL || 'http://192.168.2.100:4100';
 
 // Memory server (newcode backend)
 const MEMORY_SERVER_URL = process.env.MEVORIC_SERVER_URL
@@ -1586,6 +1586,33 @@ async function handleRegisterSkills(args) {
   return result || { registered: true, agent: agentName, count: agentSkills.length, note: 'Hub unreachable — skills registered locally only' };
 }
 
+async function handlePostAlert(args) {
+  const { content, severity, affects_projects } = args;
+  if (!content) return { error: 'content is required' };
+
+  const project = resolvedProject || process.cwd().split(/[\\/]/).pop();
+  const result = await hubFetch('POST', '/api/alerts', {
+    content,
+    severity: severity || 'warning',
+    project,
+    agent: agentName,
+    affectsProjects: affects_projects || 'all'
+  }, 5000);
+
+  return result || { error: 'Hub unreachable — alert not posted' };
+}
+
+async function handleResolveAlert(args) {
+  const { alert_id } = args;
+  if (!alert_id) return { error: 'alert_id is required' };
+
+  const result = await hubFetch('POST', `/api/alerts/${alert_id}/resolve`, {
+    agent: agentName
+  }, 5000);
+
+  return result || { error: 'Hub unreachable — could not resolve alert' };
+}
+
 // Helper for hub API calls (used by task delegation and skills)
 async function hubFetchJSON(path, opts = {}) {
   if (!HUB_URL) return null;
@@ -1856,6 +1883,31 @@ const TOOLS = [
       },
       required: ['skills']
     }
+  },
+  // --- Alerts ---
+  {
+    name: 'post_alert',
+    description: 'Post a cross-project alert when you discover something that affects multiple projects (server down, port changed, credential rotated, breaking change). All active sessions will see this alert.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        content: { type: 'string', description: 'What happened — be specific (e.g., "Server 192.168.2.100 is down", "Port 3100 changed to 3200")' },
+        severity: { type: 'string', enum: ['info', 'warning', 'critical'], description: 'How urgent: info (FYI), warning (needs attention), critical (blocking)' },
+        affects_projects: { type: 'array', items: { type: 'string' }, description: 'Which projects are affected (e.g., ["Cortex", "Clonebot"]). Omit for all projects.' }
+      },
+      required: ['content']
+    }
+  },
+  {
+    name: 'resolve_alert',
+    description: 'Mark an alert as resolved once the issue is fixed.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        alert_id: { type: 'string', description: 'The alert ID to resolve' }
+      },
+      required: ['alert_id']
+    }
   }
 ];
 
@@ -1890,6 +1942,8 @@ async function handleToolCall(name, args) {
     case 'delegate_task': return handleDelegateTask(args);
     case 'fork_session': return handleForkSession(args);
     case 'register_skills': return handleRegisterSkills(args);
+    case 'post_alert': return handlePostAlert(args);
+    case 'resolve_alert': return handleResolveAlert(args);
     default: return { error: `Unknown tool: ${name}` };
   }
 }
@@ -1997,11 +2051,10 @@ async function runCapturePrompt() {
         }
 
         // Re-register with hub under the new descriptive name
-        const hubUrl = process.env.MEVORIC_HUB_URL || process.env.AGENT_BRIDGE_HUB_URL || null;
-        if (hubUrl) {
+        if (HUB_URL) {
           const controller = new AbortController();
           const timer = setTimeout(() => controller.abort(), 3000);
-          fetch(`${hubUrl}/api/agents/register`, {
+          fetch(`${HUB_URL}/api/agents/register`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -2167,6 +2220,46 @@ async function runCapturePrompt() {
     }
   } catch {} // Best-effort
 
+  // --- "Already solved" detection: search hub knowledge for similar work in other projects ---
+  try {
+    const buildWords = /\b(build|create|implement|add|set up|configure|write|make a|fix|migrate|install|deploy|connect|integrate)\b/i;
+    if (clean.length > 50 && buildWords.test(clean)) {
+      const myProject = resolvedProject || process.cwd().split(/[\\/]/).pop();
+      // Extract key terms (strip stop words, take first 3 meaningful words)
+      const stopWords = new Set(['the','a','an','is','are','was','were','be','been','being','have','has','had','do','does','did','will','would','shall','should','may','might','must','can','could','i','you','he','she','it','we','they','me','him','her','us','them','my','your','his','its','our','their','this','that','these','those','and','but','or','nor','for','yet','so','in','on','at','to','from','by','with','of','about','into','through','during','before','after','above','below','up','down','out','off','over','under','again','further','then','once','here','there','when','where','why','how','all','both','each','few','more','most','other','some','such','no','not','only','own','same','than','too','very','just','because','as','until','while','if','what','which','who','whom','want','need','please','help','like','also','get','got','let','make','try','use','new','old','first','last','next','now','well','also']);
+      const terms = clean.toLowerCase()
+        .replace(/[^a-z0-9\s]/g, ' ')
+        .split(/\s+/)
+        .filter(w => w.length > 3 && !stopWords.has(w))
+        .slice(0, 3);
+
+      if (terms.length >= 2) {
+        const searchQuery = terms.join(' ');
+        const resp = await hubFetch('GET', `/api/knowledge?search=${encodeURIComponent(searchQuery)}`, null, 2000);
+        if (resp?.knowledge) {
+          // Only show results from OTHER projects
+          const fromOthers = resp.knowledge
+            .filter(k => k.project !== myProject)
+            .slice(0, 3);
+
+          if (fromOthers.length > 0) {
+            const lines = fromOthers.map(k =>
+              `- [${k.project}]: ${k.content.slice(0, 200)}`
+            ).join('\n');
+
+            const output = {
+              hookSpecificOutput: {
+                hookEventName: 'UserPromptSubmit',
+                additionalContext: `--- POSSIBLY RELATED (from other projects) ---\n${lines}\nCheck if any of these solve or relate to the current task before building from scratch.\n--- END ---`
+              }
+            };
+            process.stdout.write(JSON.stringify(output));
+          }
+        }
+      }
+    }
+  } catch {} // Best-effort — don't block on search
+
   process.exit(0);
 }
 
@@ -2215,6 +2308,36 @@ async function runIngest() {
 
   const name = process.env.MEVORIC_AGENT_NAME || process.env.AGENT_BRIDGE_NAME || findAgentNameForSession(sessionId);
   if (!name) process.exit(0);
+
+  const project = (resolvedProject || process.cwd().split(/[\\/]/).pop());
+
+  // --- 0. Detect corrections in user prompts and sync to hub ---
+  try {
+    const correctionPatterns = [
+      /\bdon'?t\b.*\b(do|use|add|create|make|build|put|write|include|suggest|run)\b/i,
+      /\bnever\b.*\b(do|use|add|create|make|build|put|write|include|suggest|run|guess)\b/i,
+      /\bstop\b.*\b(doing|using|adding|creating|making|suggesting)\b/i,
+      /\balways\b.*\b(do|use|check|read|ask|test|verify)\b/i,
+      /\bthat'?s\s+(wrong|incorrect|not right|not what)/i,
+      /\bi\s+told\s+you\s+(not\s+to|to\s+always|to\s+never)/i,
+      /\bno\s+not\s+that\b/i,
+      /\bwrong\s+(file|port|path|server|machine|project|database)\b/i
+    ];
+
+    for (const entry of allPrompts) {
+      const text = entry.prompt;
+      if (text.length < 15 || text.length > 500) continue; // Skip very short or very long prompts
+      const isCorrection = correctionPatterns.some(p => p.test(text));
+      if (isCorrection) {
+        await hubFetch('POST', '/api/corrections', {
+          content: text.slice(0, 300),
+          project,
+          agent: name,
+          source: 'auto-detect'
+        }, 3000);
+      }
+    }
+  } catch {} // Best-effort — don't block session exit
 
   // --- 1. Save context file (agent-bridge behavior) ---
   const safeName = name.replace(/[^a-zA-Z0-9_-]/g, '_').toLowerCase();
@@ -2310,7 +2433,6 @@ async function runIngest() {
       }
       messages.push({ role: 'assistant', content: cleanAssistant.slice(0, 10000) });
 
-      const project = (resolvedProject || process.cwd().split(/[\\/]/).pop());
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 15000);
       await fetch(`${MEMORY_SERVER_URL}/ingest`, {
@@ -2349,10 +2471,9 @@ async function runIngest() {
   // --- 5. Broadcast session-end notification to hub (shows on dashboard) ---
   try {
     const summary = userMsg.slice(0, 100) || 'session ended';
-    const hubUrl = process.env.MEVORIC_HUB_URL || process.env.AGENT_BRIDGE_HUB_URL || 'http://192.168.2.100:4100';
     const controller3 = new AbortController();
     const timer3 = setTimeout(() => controller3.abort(), 5000);
-    await fetch(`${hubUrl}/api/messages/broadcast`, {
+    await fetch(`${HUB_URL}/api/messages/broadcast`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -2367,14 +2488,12 @@ async function runIngest() {
 
   // --- 6. Auto-store knowledge from session (populates Shared Knowledge on dashboard) ---
   try {
-    const project = (resolvedProject || process.cwd().split(/[\\/]/).pop());
-    const hubUrl = process.env.MEVORIC_HUB_URL || process.env.AGENT_BRIDGE_HUB_URL || 'http://192.168.2.100:4100';
     // Build a concise knowledge summary from the session
     const taskSummary = userMsg.slice(0, 300) || 'session work';
     const responseSummary = cleanAssistant.slice(0, 500);
     const controller4 = new AbortController();
     const timer4 = setTimeout(() => controller4.abort(), 5000);
-    await fetch(`${hubUrl}/api/knowledge`, {
+    await fetch(`${HUB_URL}/api/knowledge`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -2439,21 +2558,43 @@ async function runCheckMessages() {
     return true;
   });
 
-  if (directMessages.length === 0) {
+  // Also check hub for new alerts
+  let hubAlerts = [];
+  try {
+    const alertsResp = await hubFetch('GET', '/api/alerts?active=true', null, 2000);
+    if (alertsResp?.alerts) hubAlerts = alertsResp.alerts;
+  } catch {}
+
+  if (directMessages.length === 0 && hubAlerts.length === 0) {
     process.exit(0);
   }
 
-  const formatted = directMessages.map(m => {
-    const from = m.fromName || m.from;
-    const age = Math.round((Date.now() - new Date(m.timestamp).getTime()) / 1000);
-    const ageStr = age < 60 ? `${age}s ago` : `${Math.round(age / 60)}min ago`;
-    return `[MESSAGE FROM ${from}]: ${m.content} (${ageStr})`;
-  }).join('\n\n');
+  const contextParts = [];
+
+  // Alerts first
+  if (hubAlerts.length > 0) {
+    const alertLines = hubAlerts.map(a => {
+      const ageMin = Math.round((Date.now() - new Date(a.timestamp).getTime()) / 1000 / 60);
+      return `[${(a.severity || 'warning').toUpperCase()}] ${a.content} (${ageMin}min ago)`;
+    });
+    contextParts.push(`--- ACTIVE ALERTS ---\n${alertLines.join('\n')}\n--- END ALERTS ---`);
+  }
+
+  // Messages
+  if (directMessages.length > 0) {
+    const formatted = directMessages.map(m => {
+      const from = m.fromName || m.from;
+      const age = Math.round((Date.now() - new Date(m.timestamp).getTime()) / 1000);
+      const ageStr = age < 60 ? `${age}s ago` : `${Math.round(age / 60)}min ago`;
+      return `[MESSAGE FROM ${from}]: ${m.content} (${ageStr})`;
+    }).join('\n\n');
+    contextParts.push(`--- INCOMING AGENT MESSAGES (${directMessages.length}) ---\n${formatted}\n--- END AGENT MESSAGES ---`);
+  }
 
   const output = {
     hookSpecificOutput: {
       hookEventName: data.hook_event_name || 'UserPromptSubmit',
-      additionalContext: `--- INCOMING AGENT MESSAGES (${directMessages.length}) ---\n${formatted}\n--- END AGENT MESSAGES ---\nYou received ${directMessages.length} message(s) from other agents. Read and respond to them. Use send_message to reply if needed.`
+      additionalContext: contextParts.join('\n\n')
     }
   };
 
@@ -2566,11 +2707,77 @@ async function runBootstrapContext() {
 
   const checkpoint = readLatestCheckpoint(myName, mySessionId);
 
-  if (activeAgents.length === 0 && sameProject.length === 0 && crossProject.length === 0 && messages.length === 0 && !checkpoint) {
+  // --- Fetch from hub: alerts, corrections, activity summary ---
+  let hubAlerts = [];
+  let hubCorrections = [];
+  let hubActivity = null;
+  try {
+    const since24h = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    const [alertsResp, correctionsResp, activityResp] = await Promise.all([
+      hubFetch('GET', '/api/alerts?active=true', null, 3000),
+      hubFetch('GET', `/api/corrections?since=${since24h}`, null, 3000),
+      hubFetch('GET', `/api/activity?since=${since24h}&limit=10`, null, 3000)
+    ]);
+    if (alertsResp?.alerts) hubAlerts = alertsResp.alerts;
+    if (correctionsResp?.corrections) hubCorrections = correctionsResp.corrections;
+    if (activityResp) hubActivity = activityResp;
+  } catch {} // Hub unreachable — continue with local data only
+
+  const hasHubData = hubAlerts.length > 0 || hubCorrections.length > 0 || hubActivity;
+
+  if (activeAgents.length === 0 && sameProject.length === 0 && crossProject.length === 0 && messages.length === 0 && !checkpoint && !hasHubData) {
     process.exit(0);
   }
 
   const parts = [];
+
+  // Active alerts go FIRST — most time-sensitive
+  if (hubAlerts.length > 0) {
+    const alertLines = hubAlerts.map(a => {
+      const ageMin = Math.round((Date.now() - new Date(a.timestamp).getTime()) / 1000 / 60);
+      return `[${(a.severity || 'warning').toUpperCase()}] ${a.content} (from ${a.project || 'unknown'}, ${ageMin}min ago)`;
+    });
+    parts.push(`--- ACTIVE ALERTS (${hubAlerts.length}) ---\n${alertLines.join('\n')}\n--- END ALERTS ---`);
+  }
+
+  // Recent corrections from any project
+  if (hubCorrections.length > 0) {
+    // Only show corrections from OTHER projects (current project's are already in memory)
+    const otherCorrections = hubCorrections.filter(c => c.project !== myProject);
+    if (otherCorrections.length > 0) {
+      const corrLines = otherCorrections.slice(0, 5).map(c => {
+        return `- [${c.project || 'unknown'}]: ${c.content}`;
+      });
+      parts.push(`--- CORRECTIONS FROM OTHER PROJECTS (${otherCorrections.length}) ---\n${corrLines.join('\n')}\nApply these rules to your work too.\n--- END CORRECTIONS ---`);
+    }
+  }
+
+  // Daily activity brief
+  if (hubActivity) {
+    const briefParts = [];
+    const activeAgentNames = (hubActivity.agents || [])
+      .filter(a => a.name)
+      .map(a => `${a.name} (${a.project || '?'})`);
+    if (activeAgentNames.length > 0) {
+      briefParts.push(`Active agents: ${activeAgentNames.join(', ')}`);
+    }
+    // Summarize recent knowledge by project
+    const knByProject = {};
+    for (const k of (hubActivity.recentKnowledge || [])) {
+      const p = k.project || 'unknown';
+      if (!knByProject[p]) knByProject[p] = 0;
+      knByProject[p]++;
+    }
+    const knSummary = Object.entries(knByProject).map(([p, n]) => `${p}: ${n} items`).join(', ');
+    if (knSummary) briefParts.push(`Recent knowledge: ${knSummary}`);
+    // Recent messages summary
+    const msgCount = (hubActivity.recentMessages || []).length;
+    if (msgCount > 0) briefParts.push(`Messages exchanged: ${msgCount}`);
+
+    if (briefParts.length > 0) {
+      parts.push(`--- 24H ACTIVITY BRIEF ---\n${briefParts.join('\n')}\n--- END BRIEF ---`);
+    }
+  }
 
   if (checkpoint) {
     const ageMin = Math.round((Date.now() - new Date(checkpoint.createdAt).getTime()) / 1000 / 60);
