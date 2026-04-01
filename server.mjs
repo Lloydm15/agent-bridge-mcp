@@ -2033,19 +2033,22 @@ async function runCapturePrompt() {
   const entry = JSON.stringify({ ts: Date.now(), prompt: clean });
   appendFileSync(promptFilePath, entry + '\n', 'utf8');
 
-  // --- First-prompt naming: rename agent ONCE from "abyss" to "abyss:fix-blurry-wan" ---
-  // Only rename if the agent doesn't already have a descriptive name (contains ':')
+  // --- First-prompt naming: rename agent from "abyss-3" to "abyss:fix-blurry-wan" ---
   if (isFirstPrompt && clean.length >= 5) {
     try {
       ensureDirs();
       const baseName = resolvedAgentBase || process.env.MEVORIC_AGENT_NAME || process.env.AGENT_BRIDGE_NAME;
       if (baseName) {
+        const slug = generateSlug(clean);
+        const descriptiveName = `${baseName}:${slug}`;
+
         // Find our agent file via breadcrumb (preferred) or ppid fallback
         const cwd = process.cwd();
         let foundAgentId = null;
         try {
           foundAgentId = readFileSync(resolve(tmp, `mevoric-agent-ppid-${process.ppid}`), 'utf8').trim();
         } catch {}
+        // Fallback: scan agent files for matching ppid
         if (!foundAgentId) {
           const files = readdirSync(AGENTS_DIR).filter(f => f.endsWith('.json'));
           for (const file of files) {
@@ -2053,20 +2056,7 @@ async function runCapturePrompt() {
             if (ad && ad.ppid === process.ppid) { foundAgentId = ad.id; break; }
           }
         }
-
-        // Check if agent already has a descriptive name — skip rename if so
-        let alreadyNamed = false;
         if (foundAgentId) {
-          const agentPath = resolve(AGENTS_DIR, `${foundAgentId}.json`);
-          const agentData = readAgentFile(agentPath);
-          if (agentData && agentData.name && agentData.name.includes(':')) {
-            alreadyNamed = true;
-          }
-        }
-
-        if (!alreadyNamed && foundAgentId) {
-          const slug = generateSlug(clean);
-          const descriptiveName = `${baseName}:${slug}`;
           const agentPath = resolve(AGENTS_DIR, `${foundAgentId}.json`);
           const agentData = readAgentFile(agentPath);
           if (agentData) {
