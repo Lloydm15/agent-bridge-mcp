@@ -2048,13 +2048,32 @@ async function runCapturePrompt() {
         try {
           foundAgentId = readFileSync(resolve(tmp, `mevoric-agent-ppid-${process.ppid}`), 'utf8').trim();
         } catch {}
-        // Fallback: scan agent files for matching ppid
+        // Fallback 1: scan agent files for matching ppid
         if (!foundAgentId) {
           const files = readdirSync(AGENTS_DIR).filter(f => f.endsWith('.json'));
           for (const file of files) {
             const ad = readAgentFile(resolve(AGENTS_DIR, file));
             if (ad && ad.ppid === process.ppid) { foundAgentId = ad.id; break; }
           }
+        }
+        // Fallback 2: match by cwd + baseName (ppid won't match when hook is spawned through a shell)
+        if (!foundAgentId) {
+          const normCwd = cwd.replace(/\\/g, '/').toLowerCase();
+          const files = readdirSync(AGENTS_DIR).filter(f => f.endsWith('.json'));
+          let bestMatch = null;
+          let bestTime = '';
+          for (const file of files) {
+            const ad = readAgentFile(resolve(AGENTS_DIR, file));
+            if (!ad) continue;
+            const adCwd = (ad.cwd || '').replace(/\\/g, '/').toLowerCase();
+            if (adCwd === normCwd && ad.baseName === baseName && (!ad.name || !ad.name.includes(':'))) {
+              if (!bestMatch || (ad.lastHeartbeat || '') > bestTime) {
+                bestMatch = ad.id;
+                bestTime = ad.lastHeartbeat || '';
+              }
+            }
+          }
+          foundAgentId = bestMatch;
         }
         if (foundAgentId) {
           const agentPath = resolve(AGENTS_DIR, `${foundAgentId}.json`);
@@ -2108,6 +2127,27 @@ async function runCapturePrompt() {
           const ad = readAgentFile(resolve(AGENTS_DIR, file));
           if (ad && ad.ppid === process.ppid) { myAgentId = ad.id; break; }
         }
+      }
+      // Fallback: match by cwd when ppid doesn't match (hook spawned through shell)
+      if (!myAgentId) {
+        const normCwd = process.cwd().replace(/\\/g, '/').toLowerCase();
+        const myBase = resolvedAgentBase || process.env.MEVORIC_AGENT_NAME;
+        ensureDirs();
+        const files = readdirSync(AGENTS_DIR).filter(f => f.endsWith('.json'));
+        let bestMatch = null;
+        let bestTime = '';
+        for (const file of files) {
+          const ad = readAgentFile(resolve(AGENTS_DIR, file));
+          if (!ad) continue;
+          const adCwd = (ad.cwd || '').replace(/\\/g, '/').toLowerCase();
+          if (adCwd === normCwd && (!myBase || ad.baseName === myBase)) {
+            if (!bestMatch || (ad.lastHeartbeat || '') > bestTime) {
+              bestMatch = ad.id;
+              bestTime = ad.lastHeartbeat || '';
+            }
+          }
+        }
+        myAgentId = bestMatch;
       }
       if (myAgentId) {
         ensureDirs();
