@@ -164,7 +164,14 @@ const STOP_WORDS = new Set([
   'really','please','hey','hi','ok','yeah','yes','no','not','dont','im','ive',
   'weve','lets','gonna','wanna','gotta','thats','whats','hows','about','like',
   'some','all','any','up','out','get','got','put','make','made','take','need',
-  'want','going','been','being','thing','things','stuff'
+  'want','going','been','being','thing','things','stuff',
+  // Profanity filter — keep slugs clean regardless of message tone
+  'fuck','fucking','fucked','fucker','shit','shitty','damn','damned','dammit',
+  'ass','asses','asshole','bitch','bitches','bastard','crap','crappy','hell',
+  'cunt','dick','dicks','piss','pissed','cock','bollocks','wanker','twat',
+  'nigger','nigga','faggot','fag','retard','retarded','whore','slut',
+  'motherfucker','bullshit','horseshit','goddamn','wtf','stfu','lmao','omfg',
+  'stupid','idiot','dumb','moron','ugh','argh','ffs','smh'
 ]);
 
 function generateSlug(text) {
