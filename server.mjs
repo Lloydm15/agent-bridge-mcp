@@ -595,6 +595,7 @@ async function handleRegister(args) {
   agentName = finalName;
   agentBaseName = name;
   writeAgentFile();
+  hubRegister();
 
   return {
     registered: true,
