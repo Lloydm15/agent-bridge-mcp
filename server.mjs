@@ -2944,8 +2944,16 @@ if (process.argv.includes('--capture-prompt')) {
       }
     } catch {}
 
-    // No more number suffixes — agents keep their base name.
-    // Each tab gets a unique identity through session-based hub registration instead.
+    // Only deduplicate if we still have a generic name (no colon = no descriptive slug yet)
+    if (agentName && !agentName.includes(':')) {
+      const existing = getAllAgents().filter(a => a.status === 'active' && a.name?.toLowerCase() === agentName.toLowerCase());
+      if (existing.length > 0) {
+        const allNames = getAllAgents().map(a => a.name?.toLowerCase()).filter(Boolean);
+        let suffix = 2;
+        while (allNames.includes(`${agentName.toLowerCase()}-${suffix}`)) suffix++;
+        agentName = `${agentBaseName}-${suffix}`;
+      }
+    }
 
     writeAgentFile();
     // Write breadcrumb so hooks can find our agentId via shared parent PID
