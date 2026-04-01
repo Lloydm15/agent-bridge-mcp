@@ -372,7 +372,7 @@ function startHeartbeat() {
   heartbeatTimer = setInterval(() => {
     syncNameFromDisk();
     writeAgentFile();
-    // Hub registration now handled by capture-prompt hook only (per-session, with descriptive names)
+    hubRegister();
     cleanOldMessages();
     // Clean stale contexts every 60 heartbeats (~5 min)
     if (++cleanContextCounter >= 60) {
@@ -2075,7 +2075,7 @@ async function runCapturePrompt() {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
-              id: `session-${sessionId.slice(0, 8)}`,
+              id: foundAgentId || `capture-${sessionId.slice(0, 8)}`,
               name: descriptiveName,
               baseName,
               project: (resolvedProject || process.cwd().split(/[\\/]/).pop()),
@@ -2947,7 +2947,7 @@ if (process.argv.includes('--capture-prompt')) {
     writeAgentFile();
     // Write breadcrumb so hooks can find our agentId via shared parent PID
     try { writeFileSync(resolve(tmpdir(), `mevoric-agent-ppid-${process.ppid}`), agentId); } catch {}
-    // Hub registration handled by capture-prompt hook (per-session, descriptive names)
+    hubRegister();
     startHeartbeat();
 
     // Auto-register skills for this project so other agents can discover what we do
