@@ -2118,6 +2118,29 @@ async function runCapturePrompt() {
           writeFileSync(tmpAgent, JSON.stringify(agentData, null, 2));
           renameSync(tmpAgent, agentPath);
         }
+        // Register/heartbeat to hub on every prompt so agent stays visible
+        if (HUB_URL && agentData) {
+          const controller = new AbortController();
+          const timer = setTimeout(() => controller.abort(), 3000);
+          fetch(`${HUB_URL}/api/agents/register`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              id: myAgentId,
+              name: agentData.name || resolvedAgentBase || process.env.MEVORIC_AGENT_NAME,
+              baseName: resolvedAgentBase || process.env.MEVORIC_AGENT_NAME,
+              project: (resolvedProject || process.cwd().split(/[\\/]/).pop()),
+              cwd: process.cwd(),
+              pid: process.ppid,
+              ppid: process.ppid,
+              host: hostname(),
+              sessionId,
+              startedAt: new Date().toISOString()
+            }),
+            signal: controller.signal
+          }).catch(() => {});
+          clearTimeout(timer);
+        }
       }
     } catch {}
   }
