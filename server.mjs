@@ -401,8 +401,8 @@ function startHeartbeat() {
       } catch {}
     }
     writeAgentFile();
-    // Always register with hub so every open tab is visible
-    hubRegister();
+    // Only show on hub once user has typed something (has a session)
+    if (agentSessionId) hubRegister();
     cleanOldMessages();
     // Clean stale contexts every 60 heartbeats (~5 min)
     if (++cleanContextCounter >= 60) {
@@ -2066,19 +2066,24 @@ async function runCapturePrompt() {
   if (!sessionId || !prompt) process.exit(0);
 
   const clean = stripSystemTags(prompt);
-  if (clean.length < 5) process.exit(0);
 
   // Check if this is the first prompt (JSONL file doesn't exist yet)
   const tmp = tmpdir();
   const promptFilePath = resolve(tmp, `mevoric-prompt-${sessionId}`);
   const isFirstPrompt = !existsSync(promptFilePath);
 
-  // Append to JSONL file (one line per prompt, accumulates across the session)
-  const entry = JSON.stringify({ ts: Date.now(), prompt: clean });
-  appendFileSync(promptFilePath, entry + '\n', 'utf8');
+  // Append to JSONL file even for short prompts so they count as "seen"
+  if (clean.length >= 3) {
+    const entry = JSON.stringify({ ts: Date.now(), prompt: clean });
+    appendFileSync(promptFilePath, entry + '\n', 'utf8');
+  }
 
-  // --- First-prompt naming: rename agent from "abyss-3" to "abyss:fix-blurry-wan" ---
-  if (isFirstPrompt && clean.length >= 5) {
+  // Too short for anything useful — still wrote the file above, now exit
+  if (clean.length < 5) process.exit(0);
+
+  // --- Naming: rename agent from "abyss-3" to "abyss:fix-blurry-wan" ---
+  // Try on every prompt until a name sticks (not just the first one)
+  {
     try {
       ensureDirs();
       const baseName = resolvedAgentBase || process.env.MEVORIC_AGENT_NAME || process.env.AGENT_BRIDGE_NAME;
