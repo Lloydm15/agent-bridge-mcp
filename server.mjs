@@ -174,8 +174,14 @@ const STOP_WORDS = new Set([
   'stupid','idiot','dumb','moron','ugh','argh','ffs','smh'
 ]);
 
+// Junk lines that leak into prompts from terminal/system context
+const JUNK_LINES = /windows powershell|copyright.*microsoft|all rights reserved|powershell|germinating|crunching|ps [a-z]:\\|bypass permissions|\bnode\b.*\bversion\b/i;
+
 function generateSlug(text) {
-  const words = text.toLowerCase()
+  // Only use the first meaningful line — ignore terminal/system junk
+  const lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 3 && !JUNK_LINES.test(l));
+  const firstLine = (lines[0] || text).slice(0, 200);
+  const words = firstLine.toLowerCase()
     .replace(/[^a-z0-9\s]/g, ' ')   // strip punctuation
     .split(/\s+/)                     // split on whitespace
     .filter(w => w.length > 1 && !STOP_WORDS.has(w));
@@ -365,7 +371,7 @@ function syncNameFromDisk() {
   // If the disk has a better name than our in-memory name, adopt it.
   try {
     const diskData = readAgentFile(resolve(AGENTS_DIR, `${agentId}.json`));
-    if (diskData && diskData.name && diskData.name.includes(':') && !agentName.includes(':')) {
+    if (diskData && diskData.name && diskData.name !== agentName) {
       agentName = diskData.name;
     }
     if (diskData && diskData.sessionId && !agentSessionId) {
@@ -378,13 +384,44 @@ let cleanContextCounter = 0;
 function startHeartbeat() {
   heartbeatTimer = setInterval(() => {
     syncNameFromDisk();
+    // If another agent for our session already has a descriptive name, we're a duplicate — self-remove
+    if (agentSessionId && (!agentName || !agentName.includes(':'))) {
+      try {
+        const files = readdirSync(AGENTS_DIR).filter(f => f.endsWith('.json'));
+        for (const file of files) {
+          const ad = readAgentFile(resolve(AGENTS_DIR, file));
+          if (ad && ad.id !== agentId && ad.sessionId === agentSessionId && ad.name && ad.name.includes(':')) {
+            // The other agent is the real one — remove ourselves
+            removeAgentFile();
+            hubUnregister();
+            if (heartbeatTimer) clearInterval(heartbeatTimer);
+            return;
+          }
+        }
+      } catch {}
+    }
     writeAgentFile();
+    // Always register with hub so every open tab is visible
     hubRegister();
     cleanOldMessages();
     // Clean stale contexts every 60 heartbeats (~5 min)
     if (++cleanContextCounter >= 60) {
       cleanContextCounter = 0;
       cleanStaleContexts();
+      // Also clean up agent files whose process is dead (crashed without cleanup)
+      try {
+        const files = readdirSync(AGENTS_DIR).filter(f => f.endsWith('.json'));
+        for (const file of files) {
+          const ad = readAgentFile(resolve(AGENTS_DIR, file));
+          if (!ad || ad.id === agentId) continue;
+          let alive = true;
+          try { process.kill(ad.pid, 0); } catch { alive = false; }
+          if (!alive) {
+            try { unlinkSync(resolve(AGENTS_DIR, file)); } catch {}
+            hubFetch('DELETE', `/api/agents/${ad.id}`).catch(() => {});
+          }
+        }
+      } catch {}
     }
   }, HEARTBEAT_INTERVAL_MS);
   heartbeatTimer.unref();
@@ -2046,24 +2083,17 @@ async function runCapturePrompt() {
       ensureDirs();
       const baseName = resolvedAgentBase || process.env.MEVORIC_AGENT_NAME || process.env.AGENT_BRIDGE_NAME;
       if (baseName) {
-        const slug = generateSlug(clean);
-        const descriptiveName = `${baseName}:${slug}`;
-
-        // Find our agent file via breadcrumb (preferred) or ppid fallback
+        // Find our agent file — try session breadcrumb first (written by previous hook call)
         const cwd = process.cwd();
         let foundAgentId = null;
+        // Fast path: session breadcrumb written by a previous hook call for this session
         try {
-          foundAgentId = readFileSync(resolve(tmp, `mevoric-agent-ppid-${process.ppid}`), 'utf8').trim();
+          foundAgentId = readFileSync(resolve(tmp, `mevoric-session-${sessionId}`), 'utf8').trim();
+          // Verify the file still exists
+          const checkPath = resolve(AGENTS_DIR, `${foundAgentId}.json`);
+          if (!existsSync(checkPath)) foundAgentId = null;
         } catch {}
-        // Fallback 1: scan agent files for matching ppid
-        if (!foundAgentId) {
-          const files = readdirSync(AGENTS_DIR).filter(f => f.endsWith('.json'));
-          for (const file of files) {
-            const ad = readAgentFile(resolve(AGENTS_DIR, file));
-            if (ad && ad.ppid === process.ppid) { foundAgentId = ad.id; break; }
-          }
-        }
-        // Fallback 2: match by cwd + baseName (ppid won't match when hook is spawned through a shell)
+        // Slow path: scan agent files for matching cwd + baseName, pick unnamed + unclaimed
         if (!foundAgentId) {
           const normCwd = cwd.replace(/\\/g, '/').toLowerCase();
           const files = readdirSync(AGENTS_DIR).filter(f => f.endsWith('.json'));
@@ -2073,7 +2103,7 @@ async function runCapturePrompt() {
             const ad = readAgentFile(resolve(AGENTS_DIR, file));
             if (!ad) continue;
             const adCwd = (ad.cwd || '').replace(/\\/g, '/').toLowerCase();
-            if (adCwd === normCwd && ad.baseName === baseName && (!ad.name || !ad.name.includes(':'))) {
+            if (adCwd === normCwd && ad.baseName === baseName && (!ad.name || !ad.name.includes(':')) && !ad.sessionId) {
               if (!bestMatch || (ad.lastHeartbeat || '') > bestTime) {
                 bestMatch = ad.id;
                 bestTime = ad.lastHeartbeat || '';
@@ -2082,10 +2112,17 @@ async function runCapturePrompt() {
           }
           foundAgentId = bestMatch;
         }
+        // Write session breadcrumb so future hooks for this session are instant
+        if (foundAgentId) {
+          try { writeFileSync(resolve(tmp, `mevoric-session-${sessionId}`), foundAgentId); } catch {}
+        }
         if (foundAgentId) {
           const agentPath = resolve(AGENTS_DIR, `${foundAgentId}.json`);
           const agentData = readAgentFile(agentPath);
-          if (agentData) {
+          // Skip if agent already has a descriptive name — never overwrite
+          if (agentData && (!agentData.name || !agentData.name.includes(':'))) {
+            const slug = generateSlug(clean);
+            const descriptiveName = `${baseName}:${slug}`;
             agentData.name = descriptiveName;
             agentData.sessionId = sessionId;
             const tmpAgent = agentPath + '.tmp';
@@ -2126,16 +2163,18 @@ async function runCapturePrompt() {
   if (sessionId) {
     try {
       let myAgentId = null;
-      try { myAgentId = readFileSync(resolve(tmp, `mevoric-agent-ppid-${process.ppid}`), 'utf8').trim(); } catch {}
+      // Use session breadcrumb (written by first-prompt naming above, or by a previous hook call)
+      try { myAgentId = readFileSync(resolve(tmp, `mevoric-session-${sessionId}`), 'utf8').trim(); } catch {}
+      // Fallback: scan for agent with matching sessionId already set
       if (!myAgentId) {
         ensureDirs();
         const files = readdirSync(AGENTS_DIR).filter(f => f.endsWith('.json'));
         for (const file of files) {
           const ad = readAgentFile(resolve(AGENTS_DIR, file));
-          if (ad && ad.ppid === process.ppid) { myAgentId = ad.id; break; }
+          if (ad && ad.sessionId === sessionId) { myAgentId = ad.id; break; }
         }
       }
-      // Fallback: match by cwd when ppid doesn't match (hook spawned through shell)
+      // Fallback: match by cwd + baseName, pick unclaimed agent
       if (!myAgentId) {
         const normCwd = process.cwd().replace(/\\/g, '/').toLowerCase();
         const myBase = resolvedAgentBase || process.env.MEVORIC_AGENT_NAME;
@@ -2147,7 +2186,7 @@ async function runCapturePrompt() {
           const ad = readAgentFile(resolve(AGENTS_DIR, file));
           if (!ad) continue;
           const adCwd = (ad.cwd || '').replace(/\\/g, '/').toLowerCase();
-          if (adCwd === normCwd && (!myBase || ad.baseName === myBase)) {
+          if (adCwd === normCwd && (!myBase || ad.baseName === myBase) && !ad.sessionId) {
             if (!bestMatch || (ad.lastHeartbeat || '') > bestTime) {
               bestMatch = ad.id;
               bestTime = ad.lastHeartbeat || '';
@@ -2155,6 +2194,10 @@ async function runCapturePrompt() {
           }
         }
         myAgentId = bestMatch;
+      }
+      // Write session breadcrumb for future hook calls
+      if (myAgentId) {
+        try { writeFileSync(resolve(tmp, `mevoric-session-${sessionId}`), myAgentId); } catch {}
       }
       if (myAgentId) {
         ensureDirs();
@@ -3018,7 +3061,11 @@ if (process.argv.includes('--capture-prompt')) {
     writeAgentFile();
     // Write breadcrumb so hooks can find our agentId via shared parent PID
     try { writeFileSync(resolve(tmpdir(), `mevoric-agent-ppid-${process.ppid}`), agentId); } catch {}
-    hubRegister();
+    // Also write breadcrumb by our own PID — hooks spawned through bash get a different ppid
+    try { writeFileSync(resolve(tmpdir(), `mevoric-agent-pid-${process.pid}`), agentId); } catch {}
+    // Don't register on hub until user has actually typed something (session exists)
+    // This prevents empty tabs from cluttering the dashboard
+    if (agentSessionId) hubRegister();
     startHeartbeat();
 
     // Auto-register skills for this project so other agents can discover what we do
@@ -3036,7 +3083,10 @@ if (process.argv.includes('--capture-prompt')) {
       }).catch(() => {});
     }
 
+    let cleaned = false;
     const cleanup = () => {
+      if (cleaned) return;
+      cleaned = true;
       if (heartbeatTimer) clearInterval(heartbeatTimer);
       removeAgentFile();
       try { unlinkSync(resolve(tmpdir(), `mevoric-agent-ppid-${process.ppid}`)); } catch {}
@@ -3045,6 +3095,10 @@ if (process.argv.includes('--capture-prompt')) {
     process.on('exit', cleanup);
     process.on('SIGTERM', () => { cleanup(); process.exit(0); });
     process.on('SIGINT', () => { cleanup(); process.exit(0); });
+    try { process.on('SIGHUP', () => { cleanup(); process.exit(0); }); } catch {}
+    // When Claude Code closes the tab, stdin closes — exit immediately so we clean up
+    process.stdin.on('end', () => { cleanup(); process.exit(0); });
+    process.stdin.on('close', () => { cleanup(); process.exit(0); });
 
     const transport = new StdioServerTransport();
     await server.connect(transport);

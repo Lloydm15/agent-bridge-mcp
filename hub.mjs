@@ -47,8 +47,8 @@ import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
 
 const PORT = parseInt(process.env.MEVORIC_HUB_PORT || '4100', 10);
-const STALE_MS = 15000;   // 15s without heartbeat = stale
-const DEAD_MS = 300000;   // 5min without heartbeat = dead, auto-removed
+const STALE_MS = 15000;   // 15s — kept for internal use only
+const DEAD_MS = 20000;    // 20s without heartbeat = gone (tab closed)
 const MSG_TTL_MS = 3600000; // 1 hour message expiry
 const KNOWLEDGE_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days knowledge expiry
 
@@ -400,7 +400,7 @@ function getActiveAgents() {
     const age = now - new Date(agent.lastHeartbeat).getTime();
     result.push({
       ...agent,
-      status: age > STALE_MS ? 'stale' : 'active'
+      status: 'active'  // no stale state — you're either here or gone
     });
   }
   return result;
