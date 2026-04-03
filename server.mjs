@@ -24,7 +24,7 @@ import {
 } from '@modelcontextprotocol/sdk/types.js';
 import {
   existsSync, mkdirSync, writeFileSync, readFileSync,
-  readdirSync, unlinkSync, renameSync, appendFileSync
+  readdirSync, unlinkSync, renameSync, appendFileSync, statSync
 } from 'fs';
 import { resolve, dirname } from 'path';
 import { randomBytes, randomUUID, createHash } from 'crypto';
@@ -2403,6 +2403,79 @@ async function runCapturePrompt() {
       }
     }
   } catch {} // Best-effort — don't block on search
+
+  // --- Memory File Sync: push new/changed .md files to Cortex knowledge base ---
+  try {
+    const CORTEX_INGEST = process.env.CORTEX_URL || 'http://192.168.2.100:3100';
+    const MEMORY_SYNC_STATE_FILE = resolve(tmpdir(), 'mevoric-memory-sync-state.json');
+
+    // Load previous sync state (file path → last modified timestamp)
+    let syncState = {};
+    try { syncState = JSON.parse(readFileSync(MEMORY_SYNC_STATE_FILE, 'utf8')); } catch {}
+
+    // Scan all project memory directories
+    const claudeProjectsDir = resolve(homedir(), '.claude', 'projects');
+    if (existsSync(claudeProjectsDir)) {
+      const projects = readdirSync(claudeProjectsDir).filter(d => {
+        try { return statSync(resolve(claudeProjectsDir, d)).isDirectory(); } catch { return false; }
+      });
+
+      let synced = 0;
+      for (const proj of projects) {
+        const memDir = resolve(claudeProjectsDir, proj, 'memory');
+        if (!existsSync(memDir)) continue;
+
+        const files = readdirSync(memDir).filter(f => f.endsWith('.md') && f !== 'MEMORY.md');
+        for (const file of files) {
+          const filePath = resolve(memDir, file);
+          try {
+            const mtime = statSync(filePath).mtimeMs;
+            const prevMtime = syncState[filePath];
+
+            // Skip if unchanged since last sync
+            if (prevMtime && mtime <= prevMtime) continue;
+
+            const content = readFileSync(filePath, 'utf8');
+            if (content.length < 50) continue; // Skip tiny/empty files
+
+            // Strip frontmatter
+            let body = content;
+            if (body.startsWith('---')) {
+              const end = body.indexOf('---', 3);
+              if (end > 0) body = body.substring(end + 3).trim();
+            }
+
+            // Extract project name from directory (e.g. "c--dev-Cortex" → "Cortex")
+            const projName = proj.split('-').pop() || proj;
+
+            // Send to Cortex ingest
+            const resp = await fetch(`${CORTEX_INGEST}/api/ingest`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                content: body.substring(0, 8000), // Cap at 8K to avoid embedding failures
+                title: `[Memory Sync] ${file.replace('.md', '')} (${projName})`,
+                project: projName,
+                agent: 'mevoric-memory-sync'
+              }),
+              signal: AbortSignal.timeout(15000)
+            });
+
+            if (resp.ok) {
+              syncState[filePath] = mtime;
+              synced++;
+            }
+          } catch {} // Non-fatal — skip individual files on error
+        }
+      }
+
+      // Save sync state
+      if (synced > 0) {
+        writeFileSync(MEMORY_SYNC_STATE_FILE, JSON.stringify(syncState, null, 2));
+        console.error(`[mevoric] Memory sync: ${synced} files pushed to Cortex`);
+      }
+    }
+  } catch {} // Best-effort — never block prompt on sync failure
 
   process.exit(0);
 }
