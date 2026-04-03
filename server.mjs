@@ -2078,27 +2078,110 @@ async function runCapturePrompt() {
     appendFileSync(promptFilePath, entry + '\n', 'utf8');
   }
 
-  // Too short for anything useful — still wrote the file above, now exit
+  // --- Step 1: Claim agent file by sessionId (must run before naming) ---
+  // This links the session to the correct agent file so naming can find it reliably
+  if (sessionId) {
+    try {
+      let myAgentId = null;
+      // Use session breadcrumb (written by previous hook call)
+      try { myAgentId = readFileSync(resolve(tmp, `mevoric-session-${sessionId}`), 'utf8').trim(); } catch {}
+      // Scan for agent with matching sessionId already set
+      if (!myAgentId) {
+        ensureDirs();
+        const files = readdirSync(AGENTS_DIR).filter(f => f.endsWith('.json'));
+        for (const file of files) {
+          const ad = readAgentFile(resolve(AGENTS_DIR, file));
+          if (ad && ad.sessionId === sessionId) { myAgentId = ad.id; break; }
+        }
+      }
+      // Match by cwd + baseName, pick unclaimed agent
+      if (!myAgentId) {
+        const normCwd = process.cwd().replace(/\\/g, '/').toLowerCase();
+        const myBase = resolvedAgentBase || process.env.MEVORIC_AGENT_NAME;
+        ensureDirs();
+        const files = readdirSync(AGENTS_DIR).filter(f => f.endsWith('.json'));
+        let bestMatch = null;
+        let bestTime = '';
+        for (const file of files) {
+          const ad = readAgentFile(resolve(AGENTS_DIR, file));
+          if (!ad) continue;
+          const adCwd = (ad.cwd || '').replace(/\\/g, '/').toLowerCase();
+          if (adCwd === normCwd && (!myBase || ad.baseName === myBase) && !ad.sessionId) {
+            if (!bestMatch || (ad.lastHeartbeat || '') > bestTime) {
+              bestMatch = ad.id;
+              bestTime = ad.lastHeartbeat || '';
+            }
+          }
+        }
+        myAgentId = bestMatch;
+      }
+      // Write breadcrumb + sessionId into agent file
+      if (myAgentId) {
+        try { writeFileSync(resolve(tmp, `mevoric-session-${sessionId}`), myAgentId); } catch {}
+        ensureDirs();
+        const agentPath = resolve(AGENTS_DIR, `${myAgentId}.json`);
+        const agentData = readAgentFile(agentPath);
+        if (agentData && !agentData.sessionId) {
+          agentData.sessionId = sessionId;
+          const tmpAgent = agentPath + '.tmp';
+          writeFileSync(tmpAgent, JSON.stringify(agentData, null, 2));
+          renameSync(tmpAgent, agentPath);
+        }
+        // Heartbeat to hub
+        if (HUB_URL && agentData) {
+          const controller = new AbortController();
+          const timer = setTimeout(() => controller.abort(), 3000);
+          fetch(`${HUB_URL}/api/agents/register`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              id: myAgentId,
+              name: agentData.name || resolvedAgentBase || process.env.MEVORIC_AGENT_NAME,
+              baseName: resolvedAgentBase || process.env.MEVORIC_AGENT_NAME,
+              project: (resolvedProject || process.cwd().split(/[\\/]/).pop()),
+              cwd: process.cwd(),
+              pid: process.ppid,
+              ppid: process.ppid,
+              host: hostname(),
+              sessionId,
+              startedAt: new Date().toISOString()
+            }),
+            signal: controller.signal
+          }).catch(() => {});
+          clearTimeout(timer);
+        }
+      }
+    } catch {}
+  }
+
+  // Too short for naming — but sessionId claim above already ran
   if (clean.length < 5) process.exit(0);
 
-  // --- Naming: rename agent from "abyss-3" to "abyss:fix-blurry-wan" ---
-  // Try on every prompt until a name sticks (not just the first one)
+  // --- Step 2: Naming — rename agent from "abyss-3" to "abyss:fix-blurry-wan" ---
+  // Runs on every prompt until a name sticks
   {
     try {
       ensureDirs();
       const baseName = resolvedAgentBase || process.env.MEVORIC_AGENT_NAME || process.env.AGENT_BRIDGE_NAME;
       if (baseName) {
-        // Find our agent file — try session breadcrumb first (written by previous hook call)
+        // Find our agent file
         const cwd = process.cwd();
         let foundAgentId = null;
-        // Fast path: session breadcrumb written by a previous hook call for this session
+        // 1. Session breadcrumb (written by previous hook call for this session)
         try {
           foundAgentId = readFileSync(resolve(tmp, `mevoric-session-${sessionId}`), 'utf8').trim();
-          // Verify the file still exists
           const checkPath = resolve(AGENTS_DIR, `${foundAgentId}.json`);
           if (!existsSync(checkPath)) foundAgentId = null;
         } catch {}
-        // Slow path: scan agent files for matching cwd + baseName, pick unnamed + unclaimed
+        // 2. Scan for agent that already has our sessionId (set by sessionId block below on prior prompt)
+        if (!foundAgentId) {
+          const files = readdirSync(AGENTS_DIR).filter(f => f.endsWith('.json'));
+          for (const file of files) {
+            const ad = readAgentFile(resolve(AGENTS_DIR, file));
+            if (ad && ad.sessionId === sessionId) { foundAgentId = ad.id; break; }
+          }
+        }
+        // 3. Last resort: scan by cwd + baseName, pick unnamed + unclaimed
         if (!foundAgentId) {
           const normCwd = cwd.replace(/\\/g, '/').toLowerCase();
           const files = readdirSync(AGENTS_DIR).filter(f => f.endsWith('.json'));
@@ -2164,82 +2247,7 @@ async function runCapturePrompt() {
     } catch {} // Best-effort — naming is cosmetic, don't block
   }
 
-  // Always store sessionId in the agent file so we can match agents to conversations
-  if (sessionId) {
-    try {
-      let myAgentId = null;
-      // Use session breadcrumb (written by first-prompt naming above, or by a previous hook call)
-      try { myAgentId = readFileSync(resolve(tmp, `mevoric-session-${sessionId}`), 'utf8').trim(); } catch {}
-      // Fallback: scan for agent with matching sessionId already set
-      if (!myAgentId) {
-        ensureDirs();
-        const files = readdirSync(AGENTS_DIR).filter(f => f.endsWith('.json'));
-        for (const file of files) {
-          const ad = readAgentFile(resolve(AGENTS_DIR, file));
-          if (ad && ad.sessionId === sessionId) { myAgentId = ad.id; break; }
-        }
-      }
-      // Fallback: match by cwd + baseName, pick unclaimed agent
-      if (!myAgentId) {
-        const normCwd = process.cwd().replace(/\\/g, '/').toLowerCase();
-        const myBase = resolvedAgentBase || process.env.MEVORIC_AGENT_NAME;
-        ensureDirs();
-        const files = readdirSync(AGENTS_DIR).filter(f => f.endsWith('.json'));
-        let bestMatch = null;
-        let bestTime = '';
-        for (const file of files) {
-          const ad = readAgentFile(resolve(AGENTS_DIR, file));
-          if (!ad) continue;
-          const adCwd = (ad.cwd || '').replace(/\\/g, '/').toLowerCase();
-          if (adCwd === normCwd && (!myBase || ad.baseName === myBase) && !ad.sessionId) {
-            if (!bestMatch || (ad.lastHeartbeat || '') > bestTime) {
-              bestMatch = ad.id;
-              bestTime = ad.lastHeartbeat || '';
-            }
-          }
-        }
-        myAgentId = bestMatch;
-      }
-      // Write session breadcrumb for future hook calls
-      if (myAgentId) {
-        try { writeFileSync(resolve(tmp, `mevoric-session-${sessionId}`), myAgentId); } catch {}
-      }
-      if (myAgentId) {
-        ensureDirs();
-        const agentPath = resolve(AGENTS_DIR, `${myAgentId}.json`);
-        const agentData = readAgentFile(agentPath);
-        if (agentData && !agentData.sessionId) {
-          agentData.sessionId = sessionId;
-          const tmpAgent = agentPath + '.tmp';
-          writeFileSync(tmpAgent, JSON.stringify(agentData, null, 2));
-          renameSync(tmpAgent, agentPath);
-        }
-        // Register/heartbeat to hub on every prompt so agent stays visible
-        if (HUB_URL && agentData) {
-          const controller = new AbortController();
-          const timer = setTimeout(() => controller.abort(), 3000);
-          fetch(`${HUB_URL}/api/agents/register`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              id: myAgentId,
-              name: agentData.name || resolvedAgentBase || process.env.MEVORIC_AGENT_NAME,
-              baseName: resolvedAgentBase || process.env.MEVORIC_AGENT_NAME,
-              project: (resolvedProject || process.cwd().split(/[\\/]/).pop()),
-              cwd: process.cwd(),
-              pid: process.ppid,
-              ppid: process.ppid,
-              host: hostname(),
-              sessionId,
-              startedAt: new Date().toISOString()
-            }),
-            signal: controller.signal
-          }).catch(() => {});
-          clearTimeout(timer);
-        }
-      }
-    } catch {}
-  }
+  // (sessionId claim already handled in Step 1 above)
 
   // Fire-and-forget POST to /ingest so this prompt is saved even if session crashes
   try {
