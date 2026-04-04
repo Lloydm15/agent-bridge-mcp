@@ -2778,14 +2778,7 @@ async function runCheckMessages() {
     } catch {}
   }
 
-  // Filter out session summaries — they're just noise in the prompt.
   const allMessages = [...messages, ...hubMessages];
-  const directMessages = allMessages.filter(m => {
-    const content = m.content || '';
-    // Skip session summaries like "abyss-3 finished: ..."
-    if (content.match(/^[\w-]+ finished:/)) return false;
-    return true;
-  });
 
   // Also check hub for new alerts and recent corrections
   let hubAlerts = [];
@@ -2800,7 +2793,7 @@ async function runCheckMessages() {
     if (correctionsResp?.corrections) hubCorrections = correctionsResp.corrections;
   } catch {}
 
-  if (directMessages.length === 0 && hubAlerts.length === 0 && hubCorrections.length === 0) {
+  if (allMessages.length === 0 && hubAlerts.length === 0 && hubCorrections.length === 0) {
     process.exit(0);
   }
 
@@ -2823,15 +2816,24 @@ async function runCheckMessages() {
     contextParts.push(`--- RECENT CORRECTIONS ---\n${corrLines.join('\n')}\nFollow these rules.\n--- END CORRECTIONS ---`);
   }
 
-  // Messages
-  if (directMessages.length > 0) {
-    const formatted = directMessages.map(m => {
+  // Messages with coordination rules
+  if (allMessages.length > 0) {
+    const formatted = allMessages.map(m => {
       const from = m.fromName || m.from;
       const age = Math.round((Date.now() - new Date(m.timestamp).getTime()) / 1000);
       const ageStr = age < 60 ? `${age}s ago` : `${Math.round(age / 60)}min ago`;
       return `[MESSAGE FROM ${from}]: ${m.content} (${ageStr})`;
     }).join('\n\n');
-    contextParts.push(`--- INCOMING AGENT MESSAGES (${directMessages.length}) ---\n${formatted}\n--- END AGENT MESSAGES ---`);
+    contextParts.push(`--- INCOMING AGENT MESSAGES (${allMessages.length}) ---
+RULES — YOU MUST FOLLOW THESE:
+1. READ every message below before taking any action.
+2. If another session already did something (deployed, pushed, pulled, restarted, edited a file), do NOT repeat it. Verify the current state first.
+3. If Lloyd corrected or yelled at another session, read WHY and do not make the same mistake.
+4. If another session is working on the same project, coordinate — do not edit the same files or deploy at the same time.
+5. These messages are NOT background noise. They are real events from real sessions. Act on them.
+
+${formatted}
+--- END AGENT MESSAGES ---`);
   }
 
   const output = {
@@ -2973,6 +2975,17 @@ async function runBootstrapContext() {
   }
 
   const parts = [];
+
+  // Coordination rules — injected at the top of every session bootstrap
+  parts.push(`--- MEVORIC COORDINATION RULES ---
+You are NOT working alone. Other sessions may be active on this project or related projects right now.
+1. READ all messages, contexts, and activity from other sessions before taking action.
+2. If another session already deployed, pushed, pulled, or restarted the server — do NOT repeat it. Check the current state first.
+3. If Lloyd corrected another session, treat that correction as applying to YOU too. Do not make the same mistake.
+4. If another session is editing files in the same project, check git status before editing to avoid conflicts.
+5. Before any server operation (deploy, restart, git pull), check if another session just did one. If so, verify — don't redo.
+6. These rules override any impulse to "just do it." Coordinate first, act second.
+--- END COORDINATION RULES ---`);
 
   // Active alerts go FIRST — most time-sensitive
   if (hubAlerts.length > 0) {
