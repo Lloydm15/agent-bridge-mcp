@@ -60,8 +60,8 @@ const DEAD_THRESHOLD_MS = parseInt(process.env.MEVORIC_DEAD_MS || '300000', 10);
 const MESSAGE_TTL_MS = parseInt(process.env.MEVORIC_MESSAGE_TTL_MS || '3600000', 10);
 const CONTEXT_TTL_MS = parseInt(process.env.MEVORIC_CONTEXT_TTL_MS || '7200000', 10); // 2 hours
 
-// Hub server (central agent discovery + messaging across machines)
-const HUB_URL = process.env.MEVORIC_HUB_URL || process.env.AGENT_BRIDGE_HUB_URL || 'http://192.168.2.100:4100';
+// Hub server — now lives inside Cortex (was separate Mevoric hub on port 4100)
+const HUB_URL = process.env.MEVORIC_HUB_URL || process.env.AGENT_BRIDGE_HUB_URL || 'http://192.168.2.100:3100';
 
 // Memory server (newcode backend)
 const MEMORY_SERVER_URL = process.env.MEVORIC_SERVER_URL
@@ -585,7 +585,8 @@ async function hubFetch(method, path, body = null, timeoutMs = 5000) {
       signal: controller.signal
     };
     if (body) opts.body = JSON.stringify(body);
-    const res = await fetch(`${HUB_URL}${path}`, opts);
+    const councilPath = path.replace(/^\/api\//, '/api/council/');
+    const res = await fetch(`${HUB_URL}${councilPath}`, opts);
     clearTimeout(timer);
     return await res.json();
   } catch {
@@ -1175,7 +1176,7 @@ async function handleRetrieveMemories(args) {
   const MAX_RESULTS = 10;
 
   try {
-    const data = await memoryFetch('/retrieve', {
+    const data = await memoryFetch('/api/retrieve', {
       query,
       user_id: userId,
       conversation_id: sessionConversationId,
@@ -1222,7 +1223,7 @@ async function handleStoreConversation(args) {
   const project = (resolvedProject || process.cwd().split(/[\\/]/).pop());
 
   try {
-    const data = await memoryFetch('/ingest', {
+    const data = await memoryFetch('/api/ingest', {
       messages: [
         { role: 'user', content: userMessage },
         { role: 'assistant', content: assistantResponse }
@@ -1681,7 +1682,8 @@ async function hubFetchJSON(path, opts = {}) {
   try {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 10000);
-    const res = await fetch(`${HUB_URL}${path}`, {
+    const councilPath = path.replace(/^\/api\//, '/api/council/');
+    const res = await fetch(`${HUB_URL}${councilPath}`, {
       ...opts,
       signal: controller.signal,
       headers: { 'Content-Type': 'application/json', ...(opts.headers || {}) }
@@ -2131,7 +2133,7 @@ async function runCapturePrompt() {
         if (HUB_URL && agentData) {
           const controller = new AbortController();
           const timer = setTimeout(() => controller.abort(), 3000);
-          fetch(`${HUB_URL}/api/agents/register`, {
+          fetch(`${HUB_URL}/api/council/agents/register`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -2223,7 +2225,7 @@ async function runCapturePrompt() {
         if (HUB_URL) {
           const controller = new AbortController();
           const timer = setTimeout(() => controller.abort(), 3000);
-          fetch(`${HUB_URL}/api/agents/register`, {
+          fetch(`${HUB_URL}/api/council/agents/register`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -2258,7 +2260,7 @@ async function runCapturePrompt() {
     const project = (resolvedProject || process.cwd().split(/[\\/]/).pop());
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 3000);
-    await fetch(`${MEMORY_SERVER_URL}/ingest`, {
+    await fetch(`${MEMORY_SERVER_URL}/api/ingest`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -2654,7 +2656,7 @@ async function runIngest() {
 
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 15000);
-      await fetch(`${MEMORY_SERVER_URL}/ingest`, {
+      await fetch(`${MEMORY_SERVER_URL}/api/ingest`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -2672,7 +2674,7 @@ async function runIngest() {
     try {
       const controller2 = new AbortController();
       const timer2 = setTimeout(() => controller2.abort(), 5000);
-      await fetch(`${MEMORY_SERVER_URL}/feedback`, {
+      await fetch(`${MEMORY_SERVER_URL}/api/feedback`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -2692,7 +2694,7 @@ async function runIngest() {
     const summary = userMsg.slice(0, 100) || 'session ended';
     const controller3 = new AbortController();
     const timer3 = setTimeout(() => controller3.abort(), 5000);
-    await fetch(`${HUB_URL}/api/messages/broadcast`, {
+    await fetch(`${HUB_URL}/api/council/messages/broadcast`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -2712,7 +2714,7 @@ async function runIngest() {
     const responseSummary = cleanAssistant.slice(0, 500);
     const controller4 = new AbortController();
     const timer4 = setTimeout(() => controller4.abort(), 5000);
-    await fetch(`${HUB_URL}/api/knowledge`, {
+    await fetch(`${HUB_URL}/api/council/knowledge`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
