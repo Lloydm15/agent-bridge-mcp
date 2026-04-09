@@ -123,7 +123,144 @@ async function sendReply(from, to, content) {
   });
 }
 
-// ── Ollama LLM call (local, free) ───────────────────────
+// ── Agent SDK (real Claude Code sessions with tools) ────
+
+let _sdkQuery = null;
+
+async function getSDKQuery() {
+  if (_sdkQuery) return _sdkQuery;
+  try {
+    const sdk = await import('@anthropic-ai/claude-agent-sdk');
+    _sdkQuery = sdk.query;
+    return _sdkQuery;
+  } catch (err) {
+    console.error(`[SDK] Failed to load Agent SDK: ${err.message}`);
+    return null;
+  }
+}
+
+// Project directory map — where each project lives on this PC
+const PROJECT_DIRS = {
+  'Cortex':         'c:\\dev\\Cortex',
+  'cortex':         'c:\\dev\\Cortex',
+  'Abyss':          'c:\\dev\\Abyss',
+  'abyss':          'c:\\dev\\Abyss',
+  'Mevoric':        'c:\\dev\\Mevoric',
+  'mevoric':        'c:\\dev\\Mevoric',
+  'WeFixPodcasts':  'c:\\dev\\WeFixPodcasts',
+  'wefixpodcasts':  'c:\\dev\\WeFixPodcasts',
+  'NovaStreamLive': 'c:\\dev\\NovaStreamLive',
+  'novastreamlive': 'c:\\dev\\NovaStreamLive',
+  'Clonebot':       'c:\\dev\\Clonebot',
+  'clonebot':       'c:\\dev\\Clonebot',
+  'Emergence':      'c:\\dev\\Emergence',
+  'emergence':      'c:\\dev\\Emergence',
+};
+
+function resolveProjectDir(agent) {
+  // Use agent's registered cwd if it looks like a project dir
+  if (agent.cwd && agent.cwd.toLowerCase().startsWith('c:\\dev\\')) return agent.cwd;
+  // Fall back to project name map
+  return PROJECT_DIRS[agent.project] || PROJECT_DIRS[agent.baseName] || process.cwd();
+}
+
+// Read-only tools — safe for "just look stuff up" tasks
+const READ_ONLY_TOOLS = ['Read', 'Grep', 'Glob', 'LS', 'WebSearch', 'WebFetch'];
+
+/**
+ * Execute a task using a real Claude Code session with full tool access.
+ * This is the "Limitless" upgrade — agents actually DO work, not just talk about it.
+ *
+ * @param {object} agent - The local agent handling the task
+ * @param {object} task  - The task from the hub { description, mode, fromName, project }
+ * @returns {string|null} The result text
+ */
+async function executeTaskWithSDK(agent, task) {
+  const query = await getSDKQuery();
+  if (!query) {
+    console.error(`[SDK] Agent SDK not available, falling back to Ollama`);
+    return callClaude(agent.name, agent.project || 'unknown', agent.cwd || process.cwd(), task.description, task.fromName || 'system');
+  }
+
+  const cwd = resolveProjectDir(agent);
+  const mode = task.mode || 'full';  // 'readonly' or 'full'
+  const maxTurns = task.maxTurns || (mode === 'readonly' ? 5 : 15);
+  const timeoutMs = task.timeout || (mode === 'readonly' ? 60000 : 300000);
+
+  const systemPrompt = [
+    `You are ${agent.name}, working on ${agent.project || 'unknown'}.`,
+    `${task.fromName || 'Another agent'} delegated this task to you through Mevoric.`,
+    `You have full access to the project at ${cwd}.`,
+    mode === 'readonly'
+      ? `This is a READ-ONLY task. Only look things up and report back. Do NOT edit, create, or delete any files.`
+      : `You may read, edit, create files, and run commands to complete this task.`,
+    `When done, give a clear, concise summary of what you found or did. Plain text, no markdown.`,
+    `Do NOT ask questions — just do the work and report the result.`
+  ].join(' ');
+
+  const options = {
+    maxTurns,
+    cwd,
+    systemPrompt,
+    model: 'sonnet',
+    permissionMode: 'bypassPermissions',
+    allowDangerouslySkipPermissions: true,
+    persistSession: false,
+    env: getCleanEnv(),
+  };
+
+  // Restrict tools for read-only mode
+  if (mode === 'readonly') {
+    options.tools = READ_ONLY_TOOLS;
+  }
+
+  console.log(`[SDK] Executing task for ${agent.name} | mode=${mode} | maxTurns=${maxTurns} | cwd=${cwd}`);
+
+  let fullText = '';
+  const deadline = Date.now() + timeoutMs;
+
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+    for await (const ev of query({ prompt: task.description, options, signal: controller.signal })) {
+      if (Date.now() > deadline) {
+        console.log(`[SDK] Task timed out after ${timeoutMs / 1000}s`);
+        controller.abort();
+        break;
+      }
+
+      // Collect text output
+      if (ev?.type === 'assistant' && ev.message?.content) {
+        for (const block of ev.message.content) {
+          if (block.type === 'text' && block.text) fullText += block.text;
+        }
+      }
+      if (ev?.type === 'result' && ev.text) fullText = ev.text;
+    }
+
+    clearTimeout(timer);
+  } catch (err) {
+    if (err.name === 'AbortError') {
+      console.log(`[SDK] Task aborted (timeout)`);
+    } else {
+      console.error(`[SDK] Task failed: ${err.message}`);
+      throw err;
+    }
+  }
+
+  return fullText.trim() || null;
+}
+
+function getCleanEnv() {
+  const env = { ...process.env };
+  // Remove vars that would confuse a nested Claude Code session
+  delete env.ANTHROPIC_API_KEY;
+  delete env.CLAUDECODE;
+  return env;
+}
+
+// ── Ollama LLM call (local, free — still used for messages) ──
 
 const OLLAMA_URL = process.env.OLLAMA_URL || 'http://192.168.2.169:11434';
 const OLLAMA_MODEL = process.env.OLLAMA_MODEL || 'qwen3:14b';
@@ -363,13 +500,8 @@ async function pollTasks() {
 
       (async () => {
         try {
-          const reply = await callClaude(
-            agent.name,
-            agent.project || 'unknown',
-            agent.cwd || process.cwd(),
-            task.description,
-            task.fromName || 'system'
-          );
+          // Use real Claude Code session (Agent SDK) for tasks
+          const reply = await executeTaskWithSDK(agent, task);
 
           // Report result back to hub
           await hubFetch(`/api/tasks/${task.id}/complete`, {

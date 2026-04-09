@@ -1508,10 +1508,12 @@ function stripSystemTags(text) {
 // ============================================================
 
 async function handleDelegateTask(args) {
-  const { to, targets, description, wait = true } = args;
+  const { to, targets, description, wait = true, mode = 'full', maxTurns } = args;
   if (!description) return { error: 'description is required' };
 
   const project = resolvedProject || process.cwd().split(/[\\/]/).pop();
+  const taskMode = mode === 'readonly' ? 'readonly' : 'full';
+  const waitTimeout = taskMode === 'readonly' ? 90000 : 360000;  // 90s readonly, 6min full
 
   // Fan-out mode
   if (targets && Array.isArray(targets) && targets.length > 0) {
@@ -1522,15 +1524,17 @@ async function handleDelegateTask(args) {
         fromName: agentName,
         targets: targets.map(t => ({ toName: t })),
         description,
-        project
+        project,
+        mode: taskMode,
+        maxTurns: maxTurns || null
       })
     });
     if (!result) return { error: 'Hub unreachable — cannot create fan-out task' };
 
     if (!wait) return { created: true, fanoutId: result.fanoutId, taskIds: result.taskIds };
 
-    // Poll for all results (up to 90s for fan-out)
-    const deadline = Date.now() + 90000;
+    // Poll for all results
+    const deadline = Date.now() + waitTimeout;
     while (Date.now() < deadline) {
       await new Promise(r => setTimeout(r, 3000));
       const status = await hubFetchJSON(`/api/tasks/fanout/${result.fanoutId}`);
@@ -1552,15 +1556,17 @@ async function handleDelegateTask(args) {
       to: null,
       toName: to,
       description,
-      project
+      project,
+      mode: taskMode,
+      maxTurns: maxTurns || null
     })
   });
   if (!result) return { error: 'Hub unreachable — cannot create task' };
 
   if (!wait) return { created: true, taskId: result.taskId };
 
-  // Poll for result (up to 60s)
-  const deadline = Date.now() + 60000;
+  // Poll for result
+  const deadline = Date.now() + waitTimeout;
   while (Date.now() < deadline) {
     await new Promise(r => setTimeout(r, 3000));
     const status = await hubFetchJSON(`/api/tasks/${result.taskId}`);
@@ -1900,14 +1906,16 @@ const TOOLS = [
   // --- Task delegation ---
   {
     name: 'delegate_task',
-    description: 'Assign a task to another agent and get the result back. The target agent will execute the task via the runner daemon and return a result. You can also fan out the same task to multiple agents at once.',
+    description: 'Assign a task to another agent and get the result back. The target agent will spin up a REAL Claude Code session with full tool access to execute the task — it can read files, run commands, edit code, search the web, and use all project tools. Use mode "readonly" for safe lookups or "full" for real work.',
     inputSchema: {
       type: 'object',
       properties: {
         to: { type: 'string', description: 'Agent name to assign the task to. Use "fanout" to send to multiple agents.' },
         targets: { type: 'array', items: { type: 'string' }, description: 'For fan-out: array of agent names to send the task to' },
         description: { type: 'string', description: 'What you want the agent to do' },
-        wait: { type: 'boolean', description: 'Wait for the result (default: true, polls up to 60s)' }
+        mode: { type: 'string', enum: ['readonly', 'full'], description: 'readonly = safe lookup only (no edits), full = real work with all tools (default: full)' },
+        maxTurns: { type: 'number', description: 'Max tool-use rounds (default: 5 for readonly, 15 for full)' },
+        wait: { type: 'boolean', description: 'Wait for the result (default: true, polls up to 60s for readonly, 5min for full)' }
       },
       required: ['description']
     }

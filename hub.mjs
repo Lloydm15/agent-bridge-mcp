@@ -987,7 +987,7 @@ const server = createServer(async (req, res) => {
     // POST /api/tasks — Create a task for an agent to execute
     if (method === 'POST' && path === '/api/tasks') {
       const body = await readBody(req);
-      const { from, fromName, to, toName, description, project, timeout } = body;
+      const { from, fromName, to, toName, description, project, timeout, mode, maxTurns } = body;
 
       if (!description) return json(res, { error: 'description is required' }, 400);
       if (!to && !toName) return json(res, { error: 'to or toName is required' }, 400);
@@ -1001,11 +1001,13 @@ const server = createServer(async (req, res) => {
         toName: toName || null,
         project: project || null,
         description,
-        status: 'pending',      // pending -> in_progress -> completed | failed | timeout
+        mode: mode || 'full',        // 'readonly' = look only, 'full' = do real work
+        maxTurns: maxTurns || null,   // override max tool-use rounds (null = use default)
+        status: 'pending',            // pending -> in_progress -> completed | failed | timeout
         result: null,
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
-        timeout: timeout || 300000  // default 5 min
+        timeout: timeout || 300000    // default 5 min
       };
       tasks.set(id, task);
 
@@ -1056,7 +1058,7 @@ const server = createServer(async (req, res) => {
     // POST /api/tasks/fanout — Send the same task to multiple agents, collect all results
     if (method === 'POST' && path === '/api/tasks/fanout') {
       const body = await readBody(req);
-      const { from, fromName, targets, description, project, timeout } = body;
+      const { from, fromName, targets, description, project, timeout, mode, maxTurns } = body;
 
       if (!description) return json(res, { error: 'description is required' }, 400);
       if (!targets || !Array.isArray(targets) || targets.length === 0) {
@@ -1077,6 +1079,8 @@ const server = createServer(async (req, res) => {
           toName: target.toName || target || null,
           project: project || null,
           description,
+          mode: mode || 'full',
+          maxTurns: maxTurns || null,
           status: 'pending',
           result: null,
           createdAt: new Date().toISOString(),
