@@ -139,29 +139,44 @@ async function getSDKQuery() {
   }
 }
 
-// Project directory map — where each project lives on this PC
-const PROJECT_DIRS = {
+// Project directory map — where each project lives per platform
+const IS_WINDOWS = platform() === 'win32';
+
+const PROJECT_DIRS_WIN = {
   'Cortex':         'c:\\dev\\Cortex',
-  'cortex':         'c:\\dev\\Cortex',
   'Abyss':          'c:\\dev\\Abyss',
-  'abyss':          'c:\\dev\\Abyss',
   'Mevoric':        'c:\\dev\\Mevoric',
-  'mevoric':        'c:\\dev\\Mevoric',
   'WeFixPodcasts':  'c:\\dev\\WeFixPodcasts',
-  'wefixpodcasts':  'c:\\dev\\WeFixPodcasts',
   'NovaStreamLive': 'c:\\dev\\NovaStreamLive',
-  'novastreamlive': 'c:\\dev\\NovaStreamLive',
   'Clonebot':       'c:\\dev\\Clonebot',
-  'clonebot':       'c:\\dev\\Clonebot',
   'Emergence':      'c:\\dev\\Emergence',
-  'emergence':      'c:\\dev\\Emergence',
 };
 
+const PROJECT_DIRS_LINUX = {
+  'Cortex':         '/home/toptiercrm/Cortex',
+  'Emergence':      '/home/toptiercrm/emergence',
+  'Mevoric':        '/home/toptiercrm/mevoric-repo',
+  'Clonebot':       '/home/toptiercrm/clonebot',
+};
+
+// Case-insensitive lookup
+function lookupProjectDir(name) {
+  const dirs = IS_WINDOWS ? PROJECT_DIRS_WIN : PROJECT_DIRS_LINUX;
+  // Try exact match first
+  if (dirs[name]) return dirs[name];
+  // Try case-insensitive
+  const key = Object.keys(dirs).find(k => k.toLowerCase() === name.toLowerCase());
+  return key ? dirs[key] : null;
+}
+
 function resolveProjectDir(agent) {
-  // Use agent's registered cwd if it looks like a project dir
-  if (agent.cwd && agent.cwd.toLowerCase().startsWith('c:\\dev\\')) return agent.cwd;
-  // Fall back to project name map
-  return PROJECT_DIRS[agent.project] || PROJECT_DIRS[agent.baseName] || process.cwd();
+  // Use agent's registered cwd if it's a real path (not just a fallback)
+  if (agent.cwd && agent.cwd !== process.cwd()) {
+    // Accept any absolute path — Windows (c:\...) or Linux (/home/...)
+    if (agent.cwd.match(/^[a-zA-Z]:\\/) || agent.cwd.startsWith('/')) return agent.cwd;
+  }
+  // Fall back to platform-specific project map
+  return lookupProjectDir(agent.project) || lookupProjectDir(agent.baseName) || process.cwd();
 }
 
 // Read-only tools — safe for "just look stuff up" tasks
