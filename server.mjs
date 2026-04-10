@@ -2429,7 +2429,7 @@ async function runCapturePrompt() {
         : resolve(homedir(), '.local', 'share', 'mevoric'));
     const MEMORY_SYNC_STATE_FILE = resolve(syncDir, 'memory-sync-state.json');
     const SYNC_INTERVAL_MS = 10 * 60 * 1000;  // 10 minutes between sync runs
-    const PER_FILE_TIMEOUT_MS = 5000;          // 5 seconds per POST
+    const PER_FILE_TIMEOUT_MS = 10000;         // 10 seconds per POST — quality gate runs an LLM per call
     const CONCURRENCY = 8;                     // 8 files in flight at a time
 
     // Load state (with throttle timestamp)
@@ -2492,6 +2492,19 @@ async function runCapturePrompt() {
     memorySyncPromise = (async () => {
       let synced = 0;
       let skipped = 0;
+      let lastStateSave = Date.now();
+      const STATE_SAVE_INTERVAL_MS = 1500;
+
+      // Save state to disk if enough time has passed since last save.
+      // This ensures progress is persisted even if the hook hits its 15s deadline.
+      function maybeSaveState() {
+        if (Date.now() - lastStateSave < STATE_SAVE_INTERVAL_MS) return;
+        try {
+          writeFileSync(MEMORY_SYNC_STATE_FILE, JSON.stringify(syncState, null, 2));
+          lastStateSave = Date.now();
+        } catch {}
+      }
+
       // Parallel worker pool
       let index = 0;
       async function worker() {
@@ -2512,6 +2525,7 @@ async function runCapturePrompt() {
             if (resp.ok) {
               syncState[job.filePath] = job.mtime;
               synced++;
+              maybeSaveState();
             } else {
               skipped++;
             }
