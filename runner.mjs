@@ -57,7 +57,13 @@ const conversationDepth = new Map(); // "agentA<->agentB" => count
 
 function loadCursor() {
   try {
-    return readFileSync(CURSOR_FILE, 'utf8').trim();
+    const raw = readFileSync(CURSOR_FILE, 'utf8').trim();
+    // Reject empty or invalid — a corrupted cursor file would otherwise
+    // replay every old message in the hub log (including stale sleep signals).
+    if (!raw || isNaN(new Date(raw).getTime())) {
+      return new Date().toISOString();
+    }
+    return raw;
   } catch {
     // First run — start from now so we don't replay old messages
     return new Date().toISOString();
@@ -496,21 +502,30 @@ const PC_CONTROLLER_NAME = 'pc-controller';
 // Only run sleep signals on Windows PCs — skip on Linux server
 const IS_PC = platform() === 'win32';
 
+// Independent start time for sleep-signal validation. The shared message cursor
+// can be corrupted/empty, which would make ALL historical sleep messages eligible
+// and suspend the PC on runner startup. This is our safety rail.
+const RUNNER_START_TIME = new Date();
+
 async function pollSleepSignals() {
   if (!IS_PC) return;  // Server never sleeps from this signal
 
   const data = await getMessageLog();
   if (!data || !data.messages) return;
 
-  const cursorDate = new Date(cursor);
   const sleepMessages = data.messages.filter(msg => {
     if (msg.broadcast) return false;
     if (processedSleepSignals.has(msg.id)) return false;
     const toName = msg.toName || msg.to;
     if (toName !== PC_CONTROLLER_NAME) return false;
     if (msg.content?.trim() !== 'sleep-now') return false;
-    // Only honor messages newer than the runner start cursor
-    if (new Date(msg.timestamp) <= cursorDate) return false;
+    // HARD SAFETY: only honor sleep signals sent AFTER this runner process
+    // started. Never honor historical signals from the message log, ever.
+    // This is independent of the shared message cursor so a corrupt cursor
+    // can't cause a stale sleep replay.
+    const msgTime = new Date(msg.timestamp);
+    if (isNaN(msgTime.getTime())) return false;
+    if (msgTime <= RUNNER_START_TIME) return false;
     return true;
   });
 
