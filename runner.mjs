@@ -446,13 +446,67 @@ async function poll() {
     (async () => {
       try {
         const agentProject = agent?.project || 'unknown';
-        const reply = await callClaude(
-          toName,
-          agentProject,
-          agent?.cwd || process.cwd(),
-          content,
-          fromName
-        );
+
+        // Route to the right backend based on who the message is addressed to:
+        //   cortex-brain → Cortex /api/chat (full knowledge graph + Sonnet, skipFeedback=true
+        //                   so memory confidence scores aren't damaged by agent chatter)
+        //   emergence    → Emergence /api/chat (sim state context + Ollama)
+        //   everyone else → callClaude() fallback (Haiku via /api/quick-reply)
+        let reply;
+        if (toName === 'cortex-brain' || toName === 'brain') {
+          try {
+            const chatRes = await fetch(`${CORTEX_URL}/api/chat`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                message: `Message from ${fromName}: ${content}`,
+                domain: 'coding',
+                skipFeedback: true,
+              }),
+            });
+            if (chatRes.ok) {
+              // Cortex /api/chat streams via SSE — pattern from Cortex executor.ts:3186-3193
+              const body = await chatRes.text();
+              const textChunks = body.split('\n')
+                .filter(line => line.startsWith('data: '))
+                .map(line => { try { return JSON.parse(line.slice(6)); } catch { return null; } })
+                .filter(d => d?.type === 'text')
+                .map(d => d.text);
+              reply = textChunks.join('').trim() || null;
+            } else {
+              console.error(`[Runner] cortex-brain /api/chat returned ${chatRes.status}`);
+            }
+          } catch (err) {
+            console.error(`[Runner] cortex-brain /api/chat failed: ${err.message}`);
+          }
+        } else if (toName === 'emergence') {
+          try {
+            const chatRes = await fetch(`http://192.168.2.100:3200/api/chat`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ message: `Message from ${fromName}: ${content}` }),
+            });
+            if (chatRes.ok) {
+              const data = await chatRes.json();
+              reply = (data.reply || '').trim() || null;
+            } else {
+              console.error(`[Runner] emergence /api/chat returned ${chatRes.status}`);
+            }
+          } catch (err) {
+            console.error(`[Runner] emergence /api/chat failed: ${err.message}`);
+          }
+        }
+
+        // Fallback (only runs if the special-case path didn't produce a reply)
+        if (!reply) {
+          reply = await callClaude(
+            toName,
+            agentProject,
+            agent?.cwd || process.cwd(),
+            content,
+            fromName
+          );
+        }
 
         if (reply) {
           console.log(`[${new Date().toLocaleTimeString()}] ${toName} replies to ${fromName}: ${reply.slice(0, 80)}`);
@@ -786,14 +840,17 @@ poll();
 pollTasks();
 pollSleepSignals();
 
-// Start proactive conversations — use sequential scheduling to prevent overlap
-console.log(`[Mevoric Runner] Proactive conversations every ${CONVO_INTERVAL_MS / 1000}s`);
-
+// Proactive conversations feature DISABLED 2026-04-10.
+// It was generating fake hallucinated conversations between agents (cortex-brain ↔ emergence spam)
+// that flooded the message log. Real walkie-talkie only — no auto-generated chatter.
+console.log(`[Mevoric Runner] Proactive conversations: DISABLED`);
+/*
 async function convoLoop() {
   await startConversation();
   setTimeout(convoLoop, CONVO_INTERVAL_MS);
 }
 setTimeout(convoLoop, 15000); // First one after 15s
+*/
 
 // Graceful shutdown
 process.on('SIGINT', () => {
