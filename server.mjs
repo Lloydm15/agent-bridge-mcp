@@ -2417,7 +2417,13 @@ async function runCapturePrompt() {
   // --- Memory File Sync: push new/changed .md files to Cortex knowledge base ---
   try {
     const CORTEX_INGEST = process.env.CORTEX_URL || 'http://192.168.2.100:3100';
-    const MEMORY_SYNC_STATE_FILE = resolve(tmpdir(), 'mevoric-memory-sync-state.json');
+    // Store in data dir (not temp) so state survives reboots and temp cleanup
+    const syncDir = process.env.MEVORIC_DATA_DIR
+      || process.env.AGENT_BRIDGE_DATA_DIR
+      || (platform() === 'win32'
+        ? resolve(process.env.LOCALAPPDATA || '', 'agent-bridge')
+        : resolve(homedir(), '.local', 'share', 'mevoric'));
+    const MEMORY_SYNC_STATE_FILE = resolve(syncDir, 'memory-sync-state.json');
 
     // Load previous sync state (file path → last modified timestamp)
     let syncState = {};

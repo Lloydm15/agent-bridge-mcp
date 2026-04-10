@@ -327,13 +327,12 @@ async function callClaude(agentName, project, cwd, messageContent, senderName) {
   const systemPrompt = [
     `You are ${agentName}, working on ${project}.`,
     `${senderName} sent you a message.`,
-    `STRICT RULES:`,
-    `1. ONLY use facts from the REAL FACTS section below. Nothing else.`,
-    `2. If there are NO real facts below, or the facts don't answer their question, say EXACTLY: "I don't have info on that."`,
-    `3. NEVER invent details, suggest things not in the facts, or speculate.`,
-    `4. NEVER say "you're welcome", "glad to help", or offer to collaborate on things not in the facts.`,
-    `5. Keep it to 1-2 sentences. Plain text only. No markdown. No thinking tags.`,
-    `6. If they're just being polite (thanks, welcome, etc), say "Got it." and nothing else.`
+    `RULES:`,
+    `1. If there are REAL FACTS below, use them to answer accurately.`,
+    `2. If there are no facts, answer based on what you reasonably know about ${project} as a project. Be honest about what you're unsure of.`,
+    `3. NEVER invent specific details like file names, line numbers, or config values you don't know.`,
+    `4. Keep it to 1-3 sentences. Plain text only. No markdown. No thinking tags.`,
+    `5. If they're just being polite (thanks, welcome, etc), say "Got it." and nothing else.`
   ].join(' ');
 
   const fullPrompt = `${systemPrompt}\n\nMessage from ${senderName}: "${messageContent}"${knowledgeContext}\n\nReply to them:`;
@@ -639,42 +638,28 @@ async function startConversation() {
   }
 }
 
-// ── Cortex Chat (Claude via flat-rate Cortex API) ──────
+// ── Cortex Quick Reply (lightweight — no memory retrieval, no feedback) ──
 
 async function callCortexChat(prompt) {
   try {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 120000);
+    const timer = setTimeout(() => controller.abort(), 30000);
 
-    const res = await fetch(`${CORTEX_URL}/api/chat`, {
+    // Use /api/quick-reply instead of /api/chat to avoid triggering
+    // memory retrieval and feedback — agent-to-agent messages were
+    // accidentally damaging memory confidence scores
+    const res = await fetch(`${CORTEX_URL}/api/quick-reply`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message: prompt, conversation_id: null }),
+      body: JSON.stringify({ systemPrompt: '', userMessage: prompt }),
       signal: controller.signal
     });
 
     clearTimeout(timer);
     if (!res.ok) return null;
 
-    // Parse SSE stream — collect all text chunks
-    const text = await res.text();
-    let result = '';
-    for (const line of text.split('\n')) {
-      if (!line.startsWith('data: ')) continue;
-      const payload = line.slice(6).trim();
-      if (payload === '[DONE]') break;
-      try {
-        const parsed = JSON.parse(payload);
-        if (parsed.text) result += parsed.text;
-        if (parsed.content) result += parsed.content;
-        if (parsed.delta) result += parsed.delta;
-      } catch {
-        // Not JSON — might be raw text chunk
-        if (payload && payload !== '[DONE]') result += payload;
-      }
-    }
-
-    return result.trim() || null;
+    const data = await res.json();
+    return data.reply?.trim() || null;
   } catch (err) {
     console.error(`[CortexChat] Error: ${err.message}`);
     return null;
