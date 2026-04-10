@@ -18,6 +18,7 @@
 import { readFileSync, writeFileSync, readdirSync, mkdirSync } from 'fs';
 import { resolve } from 'path';
 import { platform } from 'os';
+import { spawn } from 'child_process';
 
 // ── Config ──────────────────────────────────────────────
 
@@ -487,6 +488,57 @@ async function poll() {
   }
 }
 
+// ── PC Sleep Signal — listen for "sleep-now" from Cortex after overnight learning ──
+
+const processedSleepSignals = new Set();
+const PC_CONTROLLER_NAME = 'pc-controller';
+
+// Only run sleep signals on Windows PCs — skip on Linux server
+const IS_PC = platform() === 'win32';
+
+async function pollSleepSignals() {
+  if (!IS_PC) return;  // Server never sleeps from this signal
+
+  const data = await getMessageLog();
+  if (!data || !data.messages) return;
+
+  const cursorDate = new Date(cursor);
+  const sleepMessages = data.messages.filter(msg => {
+    if (msg.broadcast) return false;
+    if (processedSleepSignals.has(msg.id)) return false;
+    const toName = msg.toName || msg.to;
+    if (toName !== PC_CONTROLLER_NAME) return false;
+    if (msg.content?.trim() !== 'sleep-now') return false;
+    // Only honor messages newer than the runner start cursor
+    if (new Date(msg.timestamp) <= cursorDate) return false;
+    return true;
+  });
+
+  for (const msg of sleepMessages) {
+    processedSleepSignals.add(msg.id);
+    const fromName = msg.fromName || msg.from;
+    console.log(`[${new Date().toLocaleTimeString()}] [SLEEP] Received sleep-now from ${fromName}`);
+
+    if (DRY_RUN) {
+      console.log(`[DRY RUN] Would put PC to sleep now`);
+      continue;
+    }
+
+    // Give the console log time to flush, then run the Windows sleep command
+    setTimeout(() => {
+      try {
+        console.log(`[SLEEP] Running rundll32.exe powrprof.dll,SetSuspendState 0,1,0`);
+        spawn('rundll32.exe', ['powrprof.dll,SetSuspendState', '0', '1', '0'], {
+          detached: true,
+          stdio: 'ignore'
+        }).unref();
+      } catch (err) {
+        console.error(`[SLEEP] Failed to trigger sleep: ${err.message}`);
+      }
+    }, 2000);
+  }
+}
+
 // ── Task execution — agents do jobs and return results ──
 
 async function pollTasks() {
@@ -711,11 +763,13 @@ async function callOllama(systemPrompt, userMessage) {
   }
 }
 
-// Start polling for messages and tasks
+// Start polling for messages, tasks, and PC sleep signals
 setInterval(poll, POLL_MS);
 setInterval(pollTasks, POLL_MS);
+setInterval(pollSleepSignals, POLL_MS);
 poll();
 pollTasks();
+pollSleepSignals();
 
 // Start proactive conversations — use sequential scheduling to prevent overlap
 console.log(`[Mevoric Runner] Proactive conversations every ${CONVO_INTERVAL_MS / 1000}s`);
