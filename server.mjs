@@ -2064,6 +2064,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 // ============================================================
 
 async function runCapturePrompt() {
+  // Tracker for background memory sync promise — awaited before exit
+  let memorySyncPromise = null;
+
   const chunks = [];
   for await (const chunk of process.stdin) chunks.push(chunk);
   const raw = Buffer.concat(chunks).toString('utf8');
@@ -2415,83 +2418,127 @@ async function runCapturePrompt() {
   } catch {} // Best-effort — don't block on search
 
   // --- Memory File Sync: push new/changed .md files to Cortex knowledge base ---
-  try {
+  // Runs in the background, never blocks the prompt. Throttled to once every
+  // 10 minutes globally, parallelized, short timeouts, state persisted.
+  (() => {
     const CORTEX_INGEST = process.env.CORTEX_URL || 'http://192.168.2.100:3100';
-    // Store in data dir (not temp) so state survives reboots and temp cleanup
     const syncDir = process.env.MEVORIC_DATA_DIR
       || process.env.AGENT_BRIDGE_DATA_DIR
       || (platform() === 'win32'
         ? resolve(process.env.LOCALAPPDATA || '', 'agent-bridge')
         : resolve(homedir(), '.local', 'share', 'mevoric'));
     const MEMORY_SYNC_STATE_FILE = resolve(syncDir, 'memory-sync-state.json');
+    const SYNC_INTERVAL_MS = 10 * 60 * 1000;  // 10 minutes between sync runs
+    const PER_FILE_TIMEOUT_MS = 5000;          // 5 seconds per POST
+    const CONCURRENCY = 8;                     // 8 files in flight at a time
 
-    // Load previous sync state (file path → last modified timestamp)
-    let syncState = {};
-    try { syncState = JSON.parse(readFileSync(MEMORY_SYNC_STATE_FILE, 'utf8')); } catch {}
+    // Load state (with throttle timestamp)
+    let syncState = { _lastRunAt: 0 };
+    try {
+      const loaded = JSON.parse(readFileSync(MEMORY_SYNC_STATE_FILE, 'utf8'));
+      if (loaded && typeof loaded === 'object') syncState = { _lastRunAt: 0, ...loaded };
+    } catch {}
 
-    // Scan all project memory directories
+    // Throttle: bail if we ran recently
+    const now = Date.now();
+    if (now - (syncState._lastRunAt || 0) < SYNC_INTERVAL_MS) return;
+
+    // Claim this sync run IMMEDIATELY and persist — so other prompts don't also start syncing
+    syncState._lastRunAt = now;
+    try {
+      writeFileSync(MEMORY_SYNC_STATE_FILE, JSON.stringify(syncState, null, 2));
+    } catch {
+      return;  // Can't even write state — skip entire sync
+    }
+
+    // Build the work list synchronously, then process in background (no await)
     const claudeProjectsDir = resolve(homedir(), '.claude', 'projects');
-    if (existsSync(claudeProjectsDir)) {
+    if (!existsSync(claudeProjectsDir)) return;
+
+    const workList = [];
+    try {
       const projects = readdirSync(claudeProjectsDir).filter(d => {
         try { return statSync(resolve(claudeProjectsDir, d)).isDirectory(); } catch { return false; }
       });
-
-      let synced = 0;
       for (const proj of projects) {
         const memDir = resolve(claudeProjectsDir, proj, 'memory');
         if (!existsSync(memDir)) continue;
-
         const files = readdirSync(memDir).filter(f => f.endsWith('.md') && f !== 'MEMORY.md');
         for (const file of files) {
           const filePath = resolve(memDir, file);
           try {
             const mtime = statSync(filePath).mtimeMs;
-            const prevMtime = syncState[filePath];
-
-            // Skip if unchanged since last sync
-            if (prevMtime && mtime <= prevMtime) continue;
-
+            // Skip unchanged
+            if (syncState[filePath] && mtime <= syncState[filePath]) continue;
             const content = readFileSync(filePath, 'utf8');
-            if (content.length < 50) continue; // Skip tiny/empty files
-
-            // Strip frontmatter
+            if (content.length < 50) continue;
             let body = content;
             if (body.startsWith('---')) {
               const end = body.indexOf('---', 3);
               if (end > 0) body = body.substring(end + 3).trim();
             }
-
-            // Extract project name from directory (e.g. "c--dev-Cortex" → "Cortex")
             const projName = proj.split('-').pop() || proj;
+            workList.push({ filePath, mtime, body: body.substring(0, 8000), file, projName });
+          } catch {}
+        }
+      }
+    } catch {
+      return;
+    }
 
-            // Send to Cortex ingest
+    if (workList.length === 0) return;  // Nothing to do — state already saved with new _lastRunAt
+
+    // Tracked background worker — will be awaited before process.exit
+    memorySyncPromise = (async () => {
+      let synced = 0;
+      let skipped = 0;
+      // Parallel worker pool
+      let index = 0;
+      async function worker() {
+        while (index < workList.length) {
+          const job = workList[index++];
+          try {
             const resp = await fetch(`${CORTEX_INGEST}/api/ingest`, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({
-                content: body.substring(0, 8000), // Cap at 8K to avoid embedding failures
-                title: `[Memory Sync] ${file.replace('.md', '')} (${projName})`,
-                project: projName,
+                content: job.body,
+                title: `[Memory Sync] ${job.file.replace('.md', '')} (${job.projName})`,
+                project: job.projName,
                 agent: 'mevoric-memory-sync'
               }),
-              signal: AbortSignal.timeout(15000)
+              signal: AbortSignal.timeout(PER_FILE_TIMEOUT_MS)
             });
-
             if (resp.ok) {
-              syncState[filePath] = mtime;
+              syncState[job.filePath] = job.mtime;
               synced++;
+            } else {
+              skipped++;
             }
-          } catch {} // Non-fatal — skip individual files on error
+          } catch {
+            skipped++;
+          }
         }
       }
+      const workers = Array.from({ length: CONCURRENCY }, () => worker());
+      await Promise.all(workers);
 
-      // Save sync state
-      if (synced > 0) {
+      // Save final state
+      try {
         writeFileSync(MEMORY_SYNC_STATE_FILE, JSON.stringify(syncState, null, 2));
-        console.error(`[mevoric] Memory sync: ${synced} files pushed to Cortex`);
+        console.error(`[mevoric] Memory sync: ${synced} pushed, ${skipped} skipped, ${workList.length} total`);
+      } catch (err) {
+        console.error(`[mevoric] Memory sync state write failed: ${err.message}`);
       }
-    }
-  } catch {} // Best-effort — never block prompt on sync failure
+    })().catch(err => console.error(`[mevoric] Memory sync worker crashed: ${err.message}`));
+  })();
+
+  // Wait for background memory sync to finish, but cap at 15 seconds so
+  // the capture-prompt hook doesn't hold up Claude Code longer than that.
+  if (memorySyncPromise) {
+    const deadline = new Promise(r => setTimeout(r, 15000));
+    await Promise.race([memorySyncPromise, deadline]);
+  }
 
   process.exit(0);
 }
