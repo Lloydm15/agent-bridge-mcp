@@ -285,14 +285,18 @@ function getAllAgents() {
     const heartbeatAge = now - new Date(agent.lastHeartbeat).getTime();
     const pidAlive = isProcessAlive(agent.pid);
 
-    if (!pidAlive && agent.id !== agentId) {
-      try { unlinkSync(filePath); } catch {}
-      continue;
-    }
+    // Persistent agents (pid:0, persistent:true) are managed by the Mevoric runner,
+    // not by any single Claude Code session — skip the per-session cleanup.
+    if (!agent.persistent) {
+      if (!pidAlive && agent.id !== agentId) {
+        try { unlinkSync(filePath); } catch {}
+        continue;
+      }
 
-    if (heartbeatAge > DEAD_THRESHOLD_MS && agent.id !== agentId) {
-      try { unlinkSync(filePath); } catch {}
-      continue;
+      if (heartbeatAge > DEAD_THRESHOLD_MS && agent.id !== agentId) {
+        try { unlinkSync(filePath); } catch {}
+        continue;
+      }
     }
 
     agents.push({
