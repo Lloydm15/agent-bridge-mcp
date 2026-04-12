@@ -22,9 +22,11 @@ import { spawn } from 'child_process';
 
 // ── Config ──────────────────────────────────────────────
 
+// Hub now lives inside Cortex on 3100 under /api/council/*
+// Legacy env names still honored for override.
 const HUB_URL = process.env.MEVORIC_HUB_URL
   || process.env.AGENT_BRIDGE_HUB_URL
-  || 'http://192.168.2.100:4100';
+  || 'http://192.168.2.100:3100';
 
 const DATA_DIR = process.env.MEVORIC_DATA_DIR
   || process.env.AGENT_BRIDGE_DATA_DIR
@@ -98,9 +100,11 @@ function getLocalAgents() {
 
 async function hubFetch(path, opts = {}) {
   try {
+    // Translate legacy /api/* paths to Cortex council /api/council/* paths
+    const councilPath = path.replace(/^\/api\//, '/api/council/');
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 10000);
-    const res = await fetch(`${HUB_URL}${path}`, {
+    const res = await fetch(`${HUB_URL}${councilPath}`, {
       ...opts,
       signal: controller.signal,
       headers: { 'Content-Type': 'application/json', ...opts.headers }
@@ -373,6 +377,26 @@ async function poll() {
   if (localAgents.length === 0) return;
 
   const agentNames = new Set(localAgents.map(a => a.name));
+
+  // Heartbeat-register every local agent with Cortex council so /agents shows them active.
+  // Council marks agents inactive after 20s without heartbeat; our poll is every 10s.
+  for (const a of localAgents) {
+    hubFetch('/api/agents/register', {
+      method: 'POST',
+      body: JSON.stringify({
+        id: a.id,
+        name: a.name,
+        baseName: a.baseName || a.name,
+        project: a.project,
+        cwd: a.cwd,
+        pid: a.pid || 0,
+        ppid: a.ppid || 0,
+        host: platform() === 'win32' ? 'pc' : 'server',
+        sessionId: a.sessionId || null,
+        startedAt: a.startedAt || new Date().toISOString()
+      })
+    }).catch(() => {});
+  }
 
   // Fetch recent messages from hub
   const data = await getMessageLog();
