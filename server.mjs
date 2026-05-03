@@ -2774,22 +2774,28 @@ async function runIngest() {
   // Use assistant response (with question marks stripped) — NEVER the user prompt.
   // Putting userMsg here was leaking Lloyd's questions into other tabs' context,
   // which made other Claudes treat them as input and answer them. Bleed-through bug.
-  try {
-    const summary = (cleanAssistant.slice(0, 100).replace(/[?]/g, '.').trim()) || 'turn complete';
-    const controller3 = new AbortController();
-    const timer3 = setTimeout(() => controller3.abort(), 5000);
-    await fetch(`${HUB_URL}/api/council/messages/broadcast`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        from: name,
-        fromName: name,
-        content: `${name} finished: ${summary}`,
-      }),
-      signal: controller3.signal
-    });
-    clearTimeout(timer3);
-  } catch {} // Best-effort
+  // Skip entirely if the response is shorter than 50 chars of real content —
+  // kills the "session ended" / placeholder broadcasts that spam the board.
+  if ((cleanAssistant || '').trim().length < 50) {
+    // No meaningful turn — don't broadcast
+  } else {
+    try {
+      const summary = (cleanAssistant.slice(0, 100).replace(/[?]/g, '.').trim()) || 'turn complete';
+      const controller3 = new AbortController();
+      const timer3 = setTimeout(() => controller3.abort(), 5000);
+      await fetch(`${HUB_URL}/api/council/messages/broadcast`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          from: name,
+          fromName: name,
+          content: `${name} finished: ${summary}`,
+        }),
+        signal: controller3.signal
+      });
+      clearTimeout(timer3);
+    } catch {} // Best-effort
+  }
 
   // --- 6. Auto-store knowledge from session (populates Shared Knowledge on dashboard) ---
   try {
